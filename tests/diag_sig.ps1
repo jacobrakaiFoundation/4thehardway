@@ -4,7 +4,9 @@ $ErrorActionPreference = 'Continue'
 $Latin1 = [System.Text.Encoding]::GetEncoding(28591)
 "Latin1 type: $($Latin1.GetType().FullName) cp=$($Latin1.CodePage)"
 function Hex([string]$t) { (($t.ToCharArray() | ForEach-Object { '{0:X2}' -f [int]$_ }) -join ' ') }
-$files = Get-ChildItem -Path "$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules\ConfigDefender*\*" -Include *.psd1, *.psm1, *.ps1xml -File
+$files = @(foreach ($d in @("$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules\ConfigDefender", "$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules\ConfigDefenderPerformance")) {
+    Get-ChildItem -LiteralPath $d -File | Where-Object { @('.psd1', '.psm1', '.ps1xml') -contains $_.Extension } })
+"files: $($files.Count)"
 foreach ($f in $files) {
     $b = [System.IO.File]::ReadAllBytes($f.FullName)
     $s = $Latin1.GetString($b)
@@ -41,8 +43,9 @@ foreach ($f in $files) {
             } catch { "     decode error: $($_.Exception.Message)" }
         }
     }
-    "   scanner -ListCerts:"
-    $out = & pwsh -NoProfile -ExecutionPolicy Bypass -File "$PSScriptRoot\..\Scan-EmudhraRevoked.ps1" -ListCerts -Path $f.FullName 2>&1
+    $exe = if ($PSVersionTable.PSEdition -eq "Core") { "pwsh" } else { "powershell" }
+    "   scanner -ListCerts ($exe):"
+    $out = & $exe -NoProfile -ExecutionPolicy Bypass -File "$PSScriptRoot\..\Scan-EmudhraRevoked.ps1" -ListCerts -Path $f.FullName 2>&1
     $txt = ($out | Out-String)
     try { $j = $txt | ConvertFrom-Json; foreach ($x in @($j)) { "     $($x.sha1) $($x.found_as) $($x.container)" } } catch { "     (not JSON) $($txt.Substring(0, [Math]::Min(800, $txt.Length)))" }
 }
