@@ -7,7 +7,7 @@ as identified by the operating system's own signature tools (not by this project
             when present) and Windows Script Host files (.vbs/.wsf, when present) with EMBEDDED Authenticode
             signatures; signer thumbprint from Get-AuthenticodeSignature. Each file is copied first and both the
             OS tool and the scanner read the copy, so an update replacing the file mid-test cannot cause a mismatch.
-            With E2E_ALLOW_STORE_CHANGES=1, also .ps1/.vbs/.js/.wsf/.cdxml/.mof files that Windows signs during the test
+            With E2E_ALLOW_STORE_CHANGES=1, also .ps1/.vbs/.vbe/.js/.wsf/.cdxml/.mof files that Windows signs during the test
             with a throwaway self-signed certificate, so the formats Windows writes are checked.
   macOS   : Apple-signed Mach-O system binaries; signer from `codesign --extract-certificates`
   Linux   : a JAR signed during the test with keytool + jarsigner
@@ -77,6 +77,7 @@ $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=4thehardway
 try {
     $files = [ordered]@{
         'test.vbs'   = 'WScript.Echo "4thehardway"'
+        'test.vbe'   = 'WScript.Echo "4thehardway"'   # not encoded, but the file type picks the same signer as .vbs
         'test.js'    = 'WScript.Echo("4thehardway");'
         'test.wsf'   = "<job id=""t"">`r`n<script language=""VBScript"">`r`nWScript.Echo ""4thehardway""`r`n</script>`r`n</job>"
         'test.ps1'   = 'Write-Output 4thehardway'
@@ -90,7 +91,7 @@ try {
             Set-Content -LiteralPath $p -Value $files[$name] -Encoding Ascii
             try { $null = Set-AuthenticodeSignature -FilePath $p -Certificate $cert -ErrorAction Stop } catch { $status = 'Set-AuthenticodeSignature: ' + $_.Exception.Message }
             $s = Get-AuthenticodeSignature -LiteralPath $p
-            if ($null -eq $s.SignerCertificate -and $name -match '\.(vbs|js|wsf)$') {   # fall back to Windows Script Host's own signer
+            if ($null -eq $s.SignerCertificate -and $name -match '\.(vbs|vbe|js|wsf)$') {   # fall back to Windows Script Host's own signer
                 try { (New-Object -ComObject Scripting.Signer).SignFile($p, '4thehardway script signing test') } catch { $status += '; Scripting.Signer: ' + $_.Exception.Message }
                 $s = Get-AuthenticodeSignature -LiteralPath $p
             }
@@ -99,7 +100,7 @@ try {
         [void]$res.Add([ordered]@{ path = $p; kind = 'self-' + $name.Split('.')[-1]; thumbprint = $tp; status = $status })
     }
 } finally {
-    Remove-Item -LiteralPath ('Cert:\CurrentUser\My\' + $cert.Thumbprint) -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath ('Cert:\CurrentUser\My\' + $cert.Thumbprint) -DeleteKey -ErrorAction SilentlyContinue   # and its private key
 }
 ConvertTo-Json -InputObject @($res) -Depth 3
 """
@@ -246,7 +247,7 @@ def main():
                 ok = any((c.get("container") or "").startswith("OLE stream: DigitalSignature") for c in mine)
             if it["kind"] in ("script", "cdxml", "mof", "self-ps1", "self-cdxml", "self-mof"):
                 ok = any(c.get("found_as") == "powershell-signature" for c in mine)
-            if it["kind"] in ("wsh", "self-vbs", "self-js", "self-wsf"):   # Windows Script Host
+            if it["kind"] in ("wsh", "self-vbs", "self-vbe", "self-js", "self-wsf"):   # Windows Script Host
                 ok = any(c.get("found_as") == "script-signature" for c in mine)
             shown = it.get("original") or it["path"]
             print("  %-4s %-10s %s  signer %s  via %s" % ("ok" if ok else "FAIL", it["kind"], shown, it["thumbprint"], how or "-"))
@@ -260,6 +261,10 @@ def main():
                          for c in certs if norm(c["location"]) == norm(it["path"])]
                 failures.append("signer certificate not extracted from %s (tested copy %s, %d bytes); scanner reported: %s"
                                 % (shown, it["path"], os.path.getsize(it["path"]), ", ".join(found) or "no certificates"))
+                if it["kind"].startswith("self-"):     # our own throwaway test file: show how Windows signed it
+                    with open(it["path"], "rb") as fh:
+                        raw = fh.read()
+                    print("         file as signed by Windows (first 700 and last 200 bytes): %r ... %r" % (raw[:700], raw[-200:]))
         for f in failures:
             print("FAIL: " + f)
         if not failures:
