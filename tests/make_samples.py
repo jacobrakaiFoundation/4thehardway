@@ -8,7 +8,7 @@ import sys
 import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_scan import CA_DER, LEAF_DER, BENIGN_DER, pkcs7, rb, indicator_pem, FIX, msi_streams  # noqa: E402
+from test_scan import CA_DER, LEAF_DER, BENIGN_DER, pkcs7, rb, indicator_pem, FIX, msi_streams, ps1_signed, ps1xml_signed  # noqa: E402
 import cfb_writer  # noqa: E402
 
 EXPECTED = [  # (file, container, kind, indicator)
@@ -24,6 +24,9 @@ EXPECTED = [  # (file, container, kind, indicator)
     # Fragmented OLE compound file: only found by reassembling the signature streams.
     ("fragmented.msi", "OLE stream: DigitalSignature", "COMPROMISED_CA_CERT", "EM OV CS CA - G3C"),
     ("fragmented.msi", "OLE stream: MsiDigitalSignatureEx", "ISSUED_BY_COMPROMISED_CA", "EM DV TLS CA - G3B"),
+    # Signature blocks in XML comments (.ps1xml) and in a UTF-16 script.
+    ("Format.ps1xml", None, "COMPROMISED_CA_CERT", "EM OV CS CA - G3C"),
+    ("Module.psd1", None, "ISSUED_BY_COMPROMISED_CA", "EM DV TLS CA - G3B"),
 ]
 
 
@@ -53,6 +56,8 @@ def main(out):
     w("roots.pem", rb(indicator_pem("emSign_ECC_Root_CA_G3__root__")) + rb(os.path.join(FIX, "benign_ISRG_Root_X1.pem")))
     w("clean-bundle.pem", rb(os.path.join(FIX, "benign_ISRG_Root_X1.pem")) + rb(os.path.join(FIX, "nearmiss_EM_DV_TLS_CA_G3A-1.pem")))
     w("fragmented.msi", cfb_writer.build(msi_streams(), version=3))
+    w("Format.ps1xml", ps1xml_signed(pkcs7([CA_DER])))
+    w("Module.psd1", ps1_signed(pkcs7([LEAF_DER]), utf16=True))
     w("readme.txt", b"nothing to see")
     with open(os.path.join(out, "expected.json"), "w") as fh:
         json.dump(EXPECTED, fh, indent=1)

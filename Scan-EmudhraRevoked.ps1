@@ -72,6 +72,8 @@ gt2TlfJbHii+KNvK
 
 $OnWindows = ($PSVersionTable.PSEdition -eq 'Desktop') -or ((Test-Path variable:IsWindows) -and $IsWindows)
 $Latin1 = [System.Text.Encoding]::GetEncoding(28591)
+$SigMark = 'SIG # Begin signature block'
+$SigMarkU16 = $Latin1.GetString([System.Text.Encoding]::Unicode.GetBytes($SigMark))   # the marker as UTF-16LE bytes, seen through Latin-1
 $Sha256 = [System.Security.Cryptography.SHA256]::Create()
 
 function ConvertTo-Hex([byte[]]$b) { if ($null -eq $b) { return '' }; return ([BitConverter]::ToString($b)).Replace('-', '').ToLowerInvariant() }
@@ -191,10 +193,18 @@ function Find-Certs([byte[]]$bytes, [int]$depth = 0, [bool]$prefilter = $true) {
             if ($c) { [void]$out.Add(@{ Cert = $c; How = 'pem' }) }
         }
     }
-    if ($s.IndexOf('# SIG # Begin signature block', [StringComparison]::Ordinal) -ge 0) {
-        foreach ($m in [regex]::Matches($s, '# SIG # Begin signature block([\s\S]{20,400000}?)# SIG # End signature block')) {
-            $body = [regex]::Replace($m.Groups[1].Value, '(?m)^#\s?', '')
-            $raw = Get-B64Bytes $body
+    # PowerShell signature blocks: "# SIG # Begin..." in scripts, "<!-- SIG # Begin... -->" in .ps1xml/.cdxml files,
+    # and the same in scripts saved as UTF-16. Get-B64Bytes drops the "#", "<!--" and "-->" decorations.
+    $texts = New-Object System.Collections.ArrayList
+    if ($s.IndexOf($SigMark, [StringComparison]::Ordinal) -ge 0) { [void]$texts.Add($s) }
+    $u16 = $s.IndexOf($SigMarkU16, [StringComparison]::Ordinal)
+    if ($u16 -ge 0) {
+        $count = [int][math]::Min($bytes.Length - $u16, 4MB); $count -= $count % 2
+        [void]$texts.Add([System.Text.Encoding]::Unicode.GetString($bytes, $u16, $count))
+    }
+    foreach ($text in $texts) {
+        foreach ($m in [regex]::Matches($text, 'SIG # Begin signature block([\s\S]{20,400000}?)SIG # End signature block')) {
+            $raw = Get-B64Bytes $m.Groups[1].Value
             if ($raw) { foreach ($x in (Find-Certs $raw ($depth + 1) $prefilter)) { $x.How = 'powershell-signature'; [void]$out.Add($x) } }
         }
     }

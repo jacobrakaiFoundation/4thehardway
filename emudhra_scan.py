@@ -260,7 +260,11 @@ def load_indicators(path=None):
 DER_CERT_RE = re.compile(b"\x30\x82(..)\x30\x82", re.S)
 PEM_RE = re.compile(b"-----BEGIN (X509 CERTIFICATE|TRUSTED CERTIFICATE|CERTIFICATE|PKCS7|CMS)-----"
                     b"(.{20,200000}?)-----END ", re.S)
-PS_SIG_RE = re.compile(b"# SIG # Begin signature block(.{20,400000}?)# SIG # End signature block", re.S)
+# PowerShell signature blocks: "# SIG # Begin..." in scripts, "<!-- SIG # Begin... -->" in .ps1xml/.cdxml files.
+# The base64 decoder drops the "#", "<!--" and "-->" decorations.
+PS_SIG_RE = re.compile(b"SIG # Begin signature block(.{20,400000}?)SIG # End signature block", re.S)
+PS_SIG_MARK = b"SIG # Begin signature block"
+PS_SIG_MARK_U16 = PS_SIG_MARK.decode().encode("utf-16-le")   # scripts saved as UTF-16 (common in PowerShell 5.1)
 B64_JUNK_RE = re.compile(b"\\\\[rn]|[^A-Za-z0-9+/=]")
 
 
@@ -308,10 +312,13 @@ def extract_certs(data, ind, depth=0, prefilter=True):
             c = parse_cert(raw)
             if c is not None:
                 yield c, "pem"
-    if data.find(b"# SIG # Begin signature block") != -1:
-        for m in PS_SIG_RE.finditer(data):
-            body = re.sub(b"(?m)^#\\s?", b"", m.group(1))
-            raw = _b64(body)
+    texts = [data] if data.find(PS_SIG_MARK) != -1 else []
+    u16 = data.find(PS_SIG_MARK_U16)
+    if u16 != -1:
+        texts.append(bytes(data[u16:u16 + 4 * 1024 * 1024]).decode("utf-16-le", "ignore").encode("ascii", "ignore"))
+    for text in texts:
+        for m in PS_SIG_RE.finditer(text):
+            raw = _b64(m.group(1))
             if raw:
                 for c, how in extract_certs(raw, ind, depth + 1, prefilter):
                     yield c, "powershell-signature"

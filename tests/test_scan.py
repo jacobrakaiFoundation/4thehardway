@@ -72,6 +72,25 @@ def kinds(findings):
     return sorted(set((f["kind"], f["indicator"]) for f in findings))
 
 
+def _b64_lines(blob):
+    b64 = base64.b64encode(blob).decode()
+    return [b64[i:i + 64] for i in range(0, len(b64), 64)]
+
+
+def ps1_signed(blob, utf16=False):
+    """A PowerShell script with an Authenticode signature block, as Set-AuthenticodeSignature writes it."""
+    text = "Write-Host hi\r\n\r\n# SIG # Begin signature block\r\n" + \
+        "\r\n".join("# " + l for l in _b64_lines(blob)) + "\r\n# SIG # End signature block\r\n"
+    return b"\xff\xfe" + text.encode("utf-16-le") if utf16 else text.encode()
+
+
+def ps1xml_signed(blob):
+    """A .ps1xml file: the same signature block inside XML comments."""
+    return ("<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<Configuration></Configuration>\r\n"
+            "<!-- SIG # Begin signature block -->\r\n" + "\r\n".join("<!-- " + l + " -->" for l in _b64_lines(blob)) +
+            "\r\n<!-- SIG # End signature block -->\r\n").encode()
+
+
 class ScanBase(unittest.TestCase):
     def scanner(self):
         return scan.Scanner(IND, 768 * 1024 * 1024, quiet=True)
@@ -160,6 +179,15 @@ class TestContainers(ScanBase):
         f = self.scan_blob(script.encode(), "script.ps1")
         self.assertEqual(kinds(f), [("COMPROMISED_CA_CERT", "EM OV CS CA - G3C")])
         self.assertEqual(f[0]["found_as"], "powershell-signature")
+
+    def test_ps1xml_xml_comment_signature_block(self):
+        # .ps1xml/.cdxml files carry the signature in XML comments (found missing on a real Windows runner)
+        f = self.scan_blob(ps1xml_signed(pkcs7([CA_DER])), "Format.ps1xml")
+        self.assertEqual([(x["kind"], x["found_as"]) for x in f], [("COMPROMISED_CA_CERT", "powershell-signature")])
+
+    def test_utf16_powershell_script(self):
+        f = self.scan_blob(ps1_signed(pkcs7([CA_DER]), utf16=True), "Module.psd1")
+        self.assertEqual([(x["kind"], x["found_as"]) for x in f], [("COMPROMISED_CA_CERT", "powershell-signature")])
 
     def test_jar_signature_member(self):
         bio = io.BytesIO()
