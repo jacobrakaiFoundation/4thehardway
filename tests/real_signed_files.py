@@ -41,7 +41,10 @@ Get-ChildItem -LiteralPath "$env:SystemRoot\Installer" -Filter *.msi -File | Sel
 foreach ($d in @("$env:ProgramFiles\PowerShell\7", "$env:ProgramFiles\Git\cmd", "$env:ProgramFiles\Git\mingw64\bin", "$env:SystemRoot\System32")) {
     if (Test-Path -LiteralPath $d) { Get-ChildItem -Path "$d\*" -Include *.exe, *.dll -File | Select-Object -First 150 | ForEach-Object { Try-Add $_ 'pe' } }
 }
+# Defender's modules are skipped: Defender platform updates rewrite them in place, so they can change or be
+# locked between this inventory and the scan.
 Get-ChildItem -Path "$env:SystemRoot\System32\WindowsPowerShell\v1.0" -Recurse -File -Include *.ps1, *.psm1, *.psd1, *.ps1xml |
+    Where-Object { $_.FullName -notmatch '\\Modules\\(ConfigDefender|ConfigDefenderPerformance|Defender)\\' } |
     Select-Object -First 600 | ForEach-Object { Try-Add $_ 'script' }
 ConvertTo-Json -InputObject @($res) -Depth 3
 """
@@ -69,6 +72,14 @@ def list_certs(scanner, paths):
             d = json.loads(so.lstrip("\ufeff"))
             out += [d] if isinstance(d, dict) else d
     return out
+
+
+def file_sha256(path):
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError as e:
+        return "unreadable (%s)" % e
 
 
 def windows_inventory():
@@ -141,6 +152,7 @@ def main():
             for k in ("pe", "script") + (("msi",) if a.require_msi else ()):
                 if k not in kinds:
                     failures.append("no signed %s file found to test" % k)
+        before = dict((i["path"], file_sha256(i["path"])) for i in items)
         certs = list_certs(a.scanner, [i["path"] for i in items]) if items else []
         norm = lambda p: os.path.normcase(os.path.realpath(p))
         for it in items:
@@ -153,7 +165,15 @@ def main():
                 ok = any(c.get("found_as") == "powershell-signature" for c in mine)
             print("  %-4s %-6s %s  signer %s  via %s" % ("ok" if ok else "FAIL", it["kind"], it["path"], it["thumbprint"], how or "-"))
             if not ok:
-                failures.append("signer certificate not extracted from %s" % it["path"])
+                after = file_sha256(it["path"])
+                if after != before[it["path"]]:
+                    failures.append("%s changed during the test (sha256 %s -> %s); the OS signer no longer applies"
+                                    % (it["path"], before[it["path"]], after))
+                    continue
+                found = ["%s (%s, %s)" % (c["sha1"], c.get("subject_cn"), c.get("found_as"))
+                         for c in certs if norm(c["location"]) == norm(it["path"])]
+                failures.append("signer certificate not extracted from %s; scanner reported: %s"
+                                % (it["path"], ", ".join(found) or "no certificates"))
         for f in failures:
             print("FAIL: " + f)
         if not failures:
