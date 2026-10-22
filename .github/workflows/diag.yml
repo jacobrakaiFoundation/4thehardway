@@ -1,0 +1,26 @@
+name: diag
+on:
+  push:
+permissions:
+  contents: read
+jobs:
+  diag:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: pwsh diagnostics
+        shell: pwsh
+        run: ./tests/diag_sig.ps1
+      - name: Windows PowerShell diagnostics
+        shell: powershell
+        run: ./tests/diag_sig.ps1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Python list-certs
+        shell: bash
+        run: |
+          for f in /c/Windows/System32/WindowsPowerShell/v1.0/Modules/ConfigDefender*/*.ps*; do
+            echo "== $f"; python emudhra_scan.py --list-certs "$f" | python -c "import json,sys; [print('  ', x['sha1'], x['found_as'], x.get('container')) for x in json.load(sys.stdin)]"
+          done
