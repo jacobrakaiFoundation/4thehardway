@@ -31,6 +31,7 @@ $got = @{ msi = 0; pe = 0; script = 0 }
 $res = New-Object System.Collections.ArrayList
 function Try-Add($f, $kind) {
     if ($got[$kind] -ge $want[$kind]) { return }
+    if ($f.Length -gt 256MB) { return }   # Scan-EmudhraRevoked.ps1 skips files over -MaxSizeMB (default 256)
     $s = Get-AuthenticodeSignature -LiteralPath $f.FullName
     if ($null -eq $s -or $s.Status -ne 'Valid' -or $null -eq $s.SignerCertificate) { return }
     if ($s.PSObject.Properties['SignatureType'] -and [string]$s.SignatureType -ne 'Authenticode') { return }  # embedded only, not catalog
@@ -172,8 +173,8 @@ def main():
                     continue
                 found = ["%s (%s, %s)" % (c["sha1"], c.get("subject_cn"), c.get("found_as"))
                          for c in certs if norm(c["location"]) == norm(it["path"])]
-                failures.append("signer certificate not extracted from %s; scanner reported: %s"
-                                % (it["path"], ", ".join(found) or "no certificates"))
+                failures.append("signer certificate not extracted from %s (%d bytes); scanner reported: %s"
+                                % (it["path"], os.path.getsize(it["path"]), ", ".join(found) or "no certificates"))
         for f in failures:
             print("FAIL: " + f)
         if not failures:
