@@ -8,7 +8,8 @@ import sys
 import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_scan import CA_DER, LEAF_DER, BENIGN_DER, pkcs7, rb, indicator_pem, FIX  # noqa: E402
+from test_scan import CA_DER, LEAF_DER, BENIGN_DER, pkcs7, rb, indicator_pem, FIX, msi_streams  # noqa: E402
+import cfb_writer  # noqa: E402
 
 EXPECTED = [  # (file, container, kind, indicator)
     ("setup.exe", None, "COMPROMISED_CA_CERT", "EM OV CS CA - G3C"),
@@ -20,6 +21,9 @@ EXPECTED = [  # (file, container, kind, indicator)
     ("config.json", None, "ISSUED_BY_COMPROMISED_CA", "EM DV TLS CA - G3B"),
     ("server.crt", None, "ISSUED_BY_COMPROMISED_CA", "EM DV TLS CA - G3B"),
     ("roots.pem", None, "AFFECTED_ROOT", "emSign ECC Root CA - G3"),
+    # Fragmented OLE compound file: only found by reassembling the signature streams.
+    ("fragmented.msi", "OLE stream: DigitalSignature", "COMPROMISED_CA_CERT", "EM OV CS CA - G3C"),
+    ("fragmented.msi", "OLE stream: MsiDigitalSignatureEx", "ISSUED_BY_COMPROMISED_CA", "EM DV TLS CA - G3B"),
 ]
 
 
@@ -48,6 +52,7 @@ def main(out):
     w("server.crt", leaf_pem)
     w("roots.pem", rb(indicator_pem("emSign_ECC_Root_CA_G3__root__")) + rb(os.path.join(FIX, "benign_ISRG_Root_X1.pem")))
     w("clean-bundle.pem", rb(os.path.join(FIX, "benign_ISRG_Root_X1.pem")) + rb(os.path.join(FIX, "nearmiss_EM_DV_TLS_CA_G3A-1.pem")))
+    w("fragmented.msi", cfb_writer.build(msi_streams(), version=3))
     w("readme.txt", b"nothing to see")
     with open(os.path.join(out, "expected.json"), "w") as fh:
         json.dump(EXPECTED, fh, indent=1)

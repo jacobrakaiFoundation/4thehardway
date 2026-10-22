@@ -1,0 +1,149 @@
+We are reaching out to you because you maintain a trust store for TLS certificates.
+
+We became aware on the 17th of October that the private keys corresponding to 8 eMudhra Intermediate certificates have been compromised. These certificates are trusted by the Mozilla, Microsoft, Apple and Chrome root programs, as well as many of their downstream trust stores. 
+
+6 of the intermediate certificates are for use in TLS, 2 are for code signing. They are listed at the end of this mail. 
+
+Immediate action may be required to protect clients using your trust store or software package.
+
+If your clients reliably check for current revocation information and will fail-closed (deny) if it is unavailable, you do not need to take action. The affected certificates were revoked by eMudhra on the 18th of October and Sectigo on the 19th of October. If your clients do not reliably check revocation information or fail open, you need to act.
+
+If you have a mechanism for marking particular intermediates as distrusted, you should make use of it immediately and distribute the update to your users. Firefox and Chrome users have already been protected via their browser-specific blocking mechanisms (OneCRL, CRLSets).
+
+If you do not have such a system, you should evaluate whether removing trust in the root certs which have signed the impacted intermediates is suitable. We are aware of three different chains to roots which may be in use:
+
+    AAA Certificate Services (SPKI SHA-256: bd153ed7b0434f6886b17bce8bbe84ed340c7132d702a8f4fa318f756ecbd6f3)
+
+    emSign Root TLS CA - G3 (SPKI SHA-256: c619e4780ed8e0abeda24ad732567de4383a7ea941338f6d1a7d1b49ac792fe9)
+
+    emSign ECC Root CA - G3 (SPKI SHA-256: 8d417db2dd8bf5e3084d1e3f196d583849d81bdd4c00c70b9d39369e96b8c782)
+
+Removing trust in all three roots (and any other roots in your trust store which have cross-signed the affected intermediates) will provide effective protection to clients. Although the impacted intermediates have not been used by eMudhra to sign customer certificates, there are other intermediates under these roots which have been used by eMudhra to sign customer certificates. Consequently, removing trust in these roots may cause some servers to become unavailable for your clients. 
+
+We cannot provide advice on whether this decision is suitable for your clients, but we highlight that abuse of the compromised private keys is likely in the near future. 
+
+To-date, certificate transparency logs do not show any issued certificates from the compromised intermediates, but this does not rule out the past creation of unlogged certificates which would be trusted by clients which do not enforce certificate transparency or creation in the future of logged certificates which would be trusted by clients who do not enforce revocation. 
+
+At the time of writing, there is no evidence to suggest that other intermediates, or any roots operated by eMudhra or any other CA have been compromised.  
+
+There is no embargo for acting on this information. The fact that the certificates were revoked is already public. However, we ask that you give trust store operators as much time as possible to act before the nature of the incident becomes more widely known and do not draw attention to this issue except for those who need to know in order to take action. 
+
+This issue was first reported by Wayne, a member of the community. 
+
+We believe transparency is essential to trust and will disclose further information about this incident as soon as is practical.
+
+Compromised Intermediate Certificates: 
+
+EM EV TLS CA - G3B (eMudhra BV), CCADB A012304
+
+SHA-256 E7568FE6E12331F4FD7DE61DA4C7559D0F8EB192A218D4741A3BA75184333838
+
+SHA256 SPKI e0254c7fcdc265e2f0f8a428dabb75ab4ae039b4872d62f5ee57f0877d5a8a4
+
+serial c7c41efe92d825f05eae841a4a82c1, issuer emSign Root TLS CA - G3
+
+EM OV TLS CA - G3B (eMudhra BV), CCADB A012308
+
+SHA-256 98B896625C0C230ADEEC3EB2CF6AAD5001ECF9156A68644E82374CE5833BC25B
+
+SHA256 SPKI 43bffa19d6ef651451f6841e019931e96f6f2eaeff28ab4b6f1ce4576de2717
+
+serial 6cada367fb1c100088120ea202d568, issuer emSign Root TLS CA - G3
+
+EM DV TLS CA - G3B (eMudhra BV), CCADB A012302
+
+SHA-256 42C4ACCD12C4F59597925E1A08A7A90102608543809308D50EC427E118BA1493
+
+SHA256 SPKI ebed6475c2c2d80fcb199f3fe8dd6e6b3ce60b77eb15d4e42c3dec0c6f5b5105
+
+serial a4aee678f23362b4c0e460b772f214, issuer emSign Root TLS CA - G3
+
+EM EV TLS CA - G3C (eMudhra Inc), CCADB A012296
+
+SHA-256 432EC25F0D28DE9006D97BF752F17BBB2CD41F669933FCB072D9A1148D0261F3
+
+SHA256 SPKI 5c0660a2b164910d8ff589c18e14552e9e0ec237dcefe2cb736d41a4811f81a0
+
+serial 8009928a64107601af05fa2f19f109, issuer emSign Root TLS CA - G3
+
+EM OV TLS CA - G3C (eMudhra Inc), CCADB A012300
+
+SHA-256 CB6E15165AC802E9B3F993F16C25D41F4E81C21EBDE71AE1B012AC00BF9C7C3F
+
+SHA256 SPKI 63ecefee431d49523bc1136c4e72d0206a477086caf606cd5cf025686c109cf8
+
+serial 296926c227a3a1526392b19482a504, issuer emSign Root TLS CA - G3
+
+EM DV TLS CA - G3C (eMudhra Inc), CCADB A012294
+
+SHA-256 0164D7CEAE5BB909C272AF151FF44B1177AE9B47D9424B94F1D9558C30934D19
+
+SHA256 SPKI 49dd353dc2b919a3770645117d0e60c16115e7d1bc259eefe734b00ea434fe5f
+
+serial 588b2e3c2bb8cda13e1a1209254321, issuer emSign Root TLS CA - G3
+
+EM OV CS CA - G3B (eMudhra BV), CCADB A012306
+
+SHA-256 9E39DE2881273ACC225A149C72BA3E0F51424963669AB633EE1DC7DF5DB067B4
+
+SHA256 SPKI ec4ffa1ad0ac88081314b7aaffef6a91f97cd57291bb5ba686c5415f5eb4f6b6
+
+serial 7818933f8f85b4619a2b35fba83d0a, issuer emSign Root CS CA - G3
+
+EM OV CS CA - G3C (eMudhra Inc), CCADB A012298
+
+SHA-256 4B2460A466F95FD40113BCDCCA2CEB29B3B093921DE45474DA7DF48874C630B1
+
+SHA256 SPKI 92c063d67e8f14db71d288e11266ffdaf69cbf115f7bab14f3bc2f68d25e0e30
+
+serial 544b7f922c31ae220a4a922916f6e6, issuer emSign Root CS CA - G3
+
+These keys have also been cross-signed by Sectigo (SPKIs identical to the originals): 
+
+EM EV TLS CA - G3B, CCADB A012333
+
+SHA-256 579480AEA166290BD3C643589E795FC0D0E54E86505D180F1DFF99EFD3199512
+
+serial d8f8685e4f2bd9d82402a85a1c1eb731
+
+EM OV TLS CA - G3B, CCADB A012354
+
+SHA-256 5F1DED4DD590AF74631290CF073B122A2AAC6A1FA479778A0BD43579BD832699
+
+serial e94223bde92f914e5ab9acabfdac3710
+
+EM DV TLS CA - G3B, CCADB A012347
+
+SHA-256 45A883F349AEDFD5F3A649B5498FFB121712BA8B448F3F2A91DBC5A766FCDDBE
+
+serial a024fdf4ba665c785ce4a020483858b7
+
+EM EV TLS CA - G3C, CCADB A012334
+
+SHA-256 FD9D5C2DBBD4995AB69B8D50C439D9527B00529199C2FD01B2174EB58F07021F
+
+serial 05f078752dece7a1bb8595d303167171
+
+EM OV TLS CA - G3C, CCADB A012343
+
+SHA-256 7485B51C0ED192878FA1D2F948FB529AE1842CC5086C4B67F7BE5B2039DE9489
+
+serial 8d5a4811939ef447d77111cdd9849ae9
+
+EM DV TLS CA - G3C, CCADB A012342
+
+SHA-256 62B7F9868263F72F6911FC78CEAF72C1979158B7368BF648683BB2AA39B02E72
+
+serial 91f347f1a5b7d39962b95e0ee4e299d1
+
+EM OV CS CA - G3B, CCADB A012352
+
+SHA-256 A496E23AC0CAB8155FC9B117B97EAE368EFCBB9041AEC8804D5A308D2D01C2D8
+
+serial 41e32b73ac185d6ce0d7480bacf84e69
+
+EM OV CS CA - G3C, CCADB A012350
+
+SHA-256 84112972B8E59D14560AE7E7119654474AAD119990CF3722BFC1E3B91615E1FD
+
+serial d6a5ef613b390f32ef9cdf349f772841

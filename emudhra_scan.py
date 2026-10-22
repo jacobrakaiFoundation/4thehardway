@@ -131,13 +131,13 @@ def _time(buf, tag, s, e):
 
 
 class Cert(object):
-    __slots__ = ("der", "sha256", "spki_sha256", "subject_dn", "issuer_dn", "subject_cn",
+    __slots__ = ("der", "sha256", "sha1", "spki_sha256", "subject_dn", "issuer_dn", "subject_cn",
                  "issuer_cn", "ski", "aki", "serial", "not_before", "not_after")
 
     def summary(self):
         return {"subject_cn": self.subject_cn, "issuer_cn": self.issuer_cn, "serial": self.serial,
                 "not_before": self.not_before, "not_after": self.not_after,
-                "sha256": self.sha256, "spki_sha256": self.spki_sha256}
+                "sha256": self.sha256, "sha1": self.sha1, "spki_sha256": self.spki_sha256}
 
 
 def parse_cert(der):
@@ -159,6 +159,7 @@ def parse_cert(der):
         c = Cert()
         c.der = bytes(der)
         c.sha256 = hashlib.sha256(c.der).hexdigest()
+        c.sha1 = hashlib.sha1(c.der).hexdigest()   # Windows "thumbprint"; for display and comparison only
         c.spki_sha256 = hashlib.sha256(c.der[spki_t[1]:spki_t[3]]).hexdigest()
         c.issuer_dn = c.der[issuer_t[1]:issuer_t[3]].hex()
         c.subject_dn = c.der[subject_t[1]:subject_t[3]].hex()
@@ -272,9 +273,14 @@ def _b64(body):
         return b""
 
 
-def extract_certs(data, ind, depth=0):
-    """Yield (Cert, how) for every certificate found in data (bytes or mmap)."""
-    if ind.der_marker_re.search(data) is not None:
+def extract_certs(data, ind, depth=0, prefilter=True):
+    """Yield (Cert, how) for every certificate found in data (bytes or mmap).
+
+    With prefilter=True (normal scans), raw DER is only carved when the data contains the name of a
+    compromised CA or affected root; every relevant certificate carries one as subject or issuer.
+    prefilter=False carves every certificate (used by --list-certs).
+    """
+    if not prefilter or ind.der_marker_re.search(data) is not None:
         for m in DER_CERT_RE.finditer(data):
             total = 4 + int.from_bytes(m.group(1), "big")
             s = m.start()
@@ -290,7 +296,7 @@ def extract_certs(data, ind, depth=0):
             if not raw:
                 continue
             if m.group(1) in (b"PKCS7", b"CMS"):
-                for c, how in extract_certs(raw, ind, depth + 1):
+                for c, how in extract_certs(raw, ind, depth + 1, prefilter):
                     yield c, "pem-pkcs7"
                 continue
             if m.group(1) == b"TRUSTED CERTIFICATE":   # OpenSSL: cert followed by trust info
@@ -307,8 +313,89 @@ def extract_certs(data, ind, depth=0):
             body = re.sub(b"(?m)^#\\s?", b"", m.group(1))
             raw = _b64(body)
             if raw:
-                for c, how in extract_certs(raw, ind, depth + 1):
+                for c, how in extract_certs(raw, ind, depth + 1, prefilter):
                     yield c, "powershell-signature"
+
+
+# ----------------------------------------------------------------------------------------
+# OLE compound files (MSI, MSP, MSM, Office): signature streams can be split across
+# non-contiguous sectors, so they are reassembled by following the FAT chain ([MS-CFB]).
+# ----------------------------------------------------------------------------------------
+
+CFB_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def cfb_signature_streams(data, max_stream=64 * 1024 * 1024):
+    """Yield (stream_name, bytes) for every stream whose name contains "DigitalSignature"."""
+    import struct
+    try:
+        if len(data) < 1024 or bytes(data[:8]) != CFB_MAGIC:
+            return
+        hdr = bytes(data[:512])
+        ss = 1 << struct.unpack_from("<H", hdr, 0x1E)[0]
+        mss = 1 << struct.unpack_from("<H", hdr, 0x20)[0]
+        if ss not in (512, 4096) or mss != 64:
+            return
+        nfat = struct.unpack_from("<I", hdr, 0x2C)[0]
+        dir_start = struct.unpack_from("<I", hdr, 0x30)[0]
+        cutoff = struct.unpack_from("<I", hdr, 0x38)[0]
+        minifat_start, nminifat, difat_start, ndifat = struct.unpack_from("<4I", hdr, 0x3C)
+        nsect = (len(data) - ss + ss - 1) // ss          # sectors after the header (last may be short)
+        per = ss // 4
+
+        def sector(n):
+            off = (n + 1) * ss
+            return bytes(data[off:off + ss]).ljust(ss, b"\x00")
+
+        fat_secs = list(struct.unpack_from("<109I", hdr, 0x4C))
+        d, guard = difat_start, 0
+        while d < nsect and guard < min(ndifat, nsect) + 1:
+            vals = struct.unpack("<%dI" % per, sector(d))
+            fat_secs += vals[:-1]
+            d, guard = vals[-1], guard + 1
+        fat = []
+        for fs in fat_secs[:nfat]:      # an invalid FAT sector keeps its slot (as free entries) so indices stay aligned
+            fat += struct.unpack("<%dI" % per, sector(fs)) if fs < nsect else (0xFFFFFFFF,) * per
+
+        def chain(start, table, limit):
+            out, n, seen = [], start, set()
+            while n < len(table) and n not in seen and len(out) < limit:
+                seen.add(n)
+                out.append(n)
+                n = table[n]
+            return out
+
+        def read_chain(start, size):
+            return b"".join(sector(s) for s in chain(start, fat, nsect) if s < nsect)[:size]
+
+        dirs = read_chain(dir_start, nsect * ss)
+        entries = []
+        for i in range(0, len(dirs) - 127, 128):
+            e = dirs[i:i + 128]
+            nlen = struct.unpack_from("<H", e, 0x40)[0]
+            name = e[:nlen - 2].decode("utf-16-le", "replace") if 2 <= nlen <= 64 else ""
+            size = struct.unpack_from("<Q", e, 0x78)[0]
+            if ss == 512:
+                size &= 0xFFFFFFFF                          # version 3 files: high dword is undefined
+            entries.append((name, e[0x42], struct.unpack_from("<I", e, 0x74)[0], size))
+        if not entries or entries[0][1] != 5:               # entry 0 must be the root storage
+            return
+        ministream = minifat = None
+        for name, typ, start, size in entries[1:]:
+            if typ != 2 or "digitalsignature" not in name.lower() or not 0 < size <= max_stream:
+                continue
+            if size < cutoff:
+                if ministream is None:
+                    ministream = read_chain(entries[0][2], entries[0][3])
+                    mf = read_chain(minifat_start, nminifat * ss) if minifat_start < nsect else b""
+                    minifat = struct.unpack("<%dI" % (len(mf) // 4), mf[:len(mf) // 4 * 4])
+                secs = chain(start, minifat, len(ministream) // mss + 1)
+                buf = b"".join(ministream[s * mss:(s + 1) * mss] for s in secs)[:size]
+            else:
+                buf = read_chain(start, size)
+            yield re.sub(r"[\x00-\x1f]", "", name), buf
+    except (struct.error, IndexError, ValueError, OverflowError, MemoryError):
+        return
 
 
 # ----------------------------------------------------------------------------------------
@@ -352,25 +439,43 @@ ADVICE = {
 }
 
 
+OLE_PREFIX = "OLE stream: "
+
+
 class Scanner(object):
-    def __init__(self, ind, max_size, quiet=False, exclude=()):
+    def __init__(self, ind, max_size, quiet=False, exclude=(), collect_all=False, deadline=None):
         self.ind = ind
         self.max_size = max_size
         self.quiet = quiet
         self.exclude = tuple(os.path.normcase(os.path.abspath(p)) for p in exclude)
+        self.collect_all = collect_all      # --list-certs: record every certificate, skip the prefilter
+        self.deadline = deadline            # --time-limit: stop walking files after this time.time()
         self.findings, self._seen, self._inodes = [], set(), set()
+        self.all_certs, self._all_seen = [], set()
         self.stats = {"trust_store_sources": 0, "files_scanned": 0, "files_skipped_size": 0,
-                      "files_unreadable": 0, "bytes_scanned": 0, "certificates_parsed": 0}
+                      "files_unreadable": 0, "bytes_scanned": 0, "certificates_parsed": 0,
+                      "ole_signature_streams": 0, "time_limited": False}
         self._last_progress = time.time()
 
     # -- findings ----------------------------------------------------------------------
     def add(self, c, location, source, container=None, how=None, store=None):
         self.stats["certificates_parsed"] += 1
+        if self.collect_all:
+            k = (location, container, c.sha256)
+            if k not in self._all_seen:
+                self._all_seen.add(k)
+                self.all_certs.append(dict(c.summary(), location=location, container=container, found_as=how,
+                                           store=store))
         hit = self.ind.classify(c)
         if not hit:
             return
         kind, e = hit
-        key = (location, container, c.sha256, kind)
+        # A certificate found both in a reassembled OLE stream and by the raw scan of the same file
+        # is one finding; the OLE stream (scanned first) supplies the container name.
+        ckey = container
+        if container and OLE_PREFIX in container:
+            ckey = container.split(OLE_PREFIX)[0].rstrip("!/") or None
+        key = (location, ckey, c.sha256, kind)
         if key in self._seen:
             return
         self._seen.add(key)
@@ -384,8 +489,14 @@ class Scanner(object):
             "certificate": c.summary(), "advice": note or ADVICE[kind], "running_processes": []})
 
     def scan_bytes(self, data, location, source, container=None, store=None):
-        for c, how in extract_certs(data, self.ind):
+        for c, how in extract_certs(data, self.ind, prefilter=not self.collect_all):
             self.add(c, location, source, container, how, store)
+
+    def out_of_time(self):
+        if self.deadline is not None and time.time() > self.deadline:
+            self.stats["time_limited"] = True
+            return True
+        return False
 
     # -- files -------------------------------------------------------------------------
     def _progress(self):
@@ -445,6 +556,10 @@ class Scanner(object):
                 else:
                     data = fh.read()
                 try:
+                    if data[:8] == CFB_MAGIC:
+                        for name, buf in cfb_signature_streams(data, self.max_size):
+                            self.stats["ole_signature_streams"] += 1
+                            self.scan_bytes(buf, path, source, container=OLE_PREFIX + name)
                     self.scan_bytes(data, path, source)
                     if data[:4] == b"PK\x03\x04" and os.path.splitext(path)[1].lower() in ZIP_EXTS:
                         self.scan_zip(path, path, source, depth=0)
@@ -476,6 +591,10 @@ class Scanner(object):
                         continue
                     data = zf.read(zi)
                     if interesting:
+                        if data[:8] == CFB_MAGIC:
+                            for sname, buf in cfb_signature_streams(data, self.max_size):
+                                self.stats["ole_signature_streams"] += 1
+                                self.scan_bytes(buf, location, source, container=member + "!/" + OLE_PREFIX + sname)
                         self.scan_bytes(data, location, source, container=member)
                     if nested and data[:4] == b"PK\x03\x04":
                         self.scan_zip(io.BytesIO(data), location, source, depth + 1, prefix=member + "!/")
@@ -497,6 +616,8 @@ class Scanner(object):
                 dirnames[:] = [d for d in dirnames if d not in SKIP_DIR_NAMES
                                and os.path.normcase(os.path.join(dirpath, d)) not in active]
                 for fn in filenames:
+                    if self.out_of_time():
+                        return
                     self.scan_file(os.path.join(dirpath, fn), source)
 
     # -- OS trust stores ---------------------------------------------------------------
@@ -541,9 +662,23 @@ class Scanner(object):
         kcs = ["/System/Library/Keychains/SystemRootCertificates.keychain",
                "/Library/Keychains/System.keychain",
                os.path.expanduser("~/Library/Keychains/login.keychain-db")]
-        for kc in kcs:
-            if not os.path.exists(kc):
+        # Plus every keychain in the user's and system search lists (custom keychains included).
+        for domain in ("user", "system"):
+            try:
+                out = subprocess.run(["security", "list-keychains", "-d", domain], stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, timeout=60).stdout.decode("utf-8", "replace")
+            except Exception:
                 continue
+            for line in out.splitlines():
+                p = line.strip().strip('"')
+                if p and p not in kcs:
+                    kcs.append(p)
+        seen = set()
+        for kc in kcs:
+            real = os.path.realpath(kc)
+            if real in seen or not os.path.exists(kc):
+                continue
+            seen.add(real)
             cmd = ["security", "find-certificate", "-a", "-p", kc]
             try:
                 out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=120).stdout
@@ -723,6 +858,8 @@ def report_text(findings, stats, meta, out):
         stats["certificates_parsed"]))
     if stats["files_skipped_size"] or stats["files_unreadable"]:
         w("Skipped %d files over the size limit and %d unreadable files.\n" % (stats["files_skipped_size"], stats["files_unreadable"]))
+    if stats.get("time_limited"):
+        w("Stopped scanning files early because of --time-limit; the file scan is incomplete.\n")
     for sev in ("CRITICAL", "WARNING", "INFO"):
         group = [f for f in findings if f["severity"] == sev]
         if not group:
@@ -757,6 +894,10 @@ def main(argv=None):
     ap.add_argument("--no-processes", action="store_true", help="do not look up running processes")
     ap.add_argument("--indicators", metavar="FILE", help="use this indicators.json instead of the built-in copy")
     ap.add_argument("--include-self", action="store_true", help="do not skip this tool's own directory")
+    ap.add_argument("--time-limit", type=int, metavar="SECONDS", help="stop scanning files after this long and report "
+                    "what was covered (trust stores are always scanned in full)")
+    ap.add_argument("--list-certs", nargs="+", metavar="PATH", help="print every certificate found in these files or "
+                    "directories as JSON, whether or not it is related to eMudhra, and exit")
     ap.add_argument("--self-test", action="store_true", help="check the detection engine and exit")
     ap.add_argument("--quiet", action="store_true", help="no progress messages")
     ap.add_argument("--version", action="version", version=VERSION)
@@ -773,14 +914,25 @@ def main(argv=None):
             print("%-22s %s" % (k, "ok" if v else "FAILED"))
         print("self-test %s" % ("passed" if ok else "FAILED"))
         return 0 if ok else 3
+    if a.list_certs:
+        sc = Scanner(ind, a.max_size * 1024 * 1024, quiet=True, collect_all=True)
+        for p in a.list_certs:
+            if os.path.isdir(p):
+                sc.walk([p], "file")
+            else:
+                sc.scan_file(p, "file", force=True)
+        json.dump(sc.all_certs, sys.stdout, indent=1)
+        sys.stdout.write("\n")
+        return 0
 
     system = platform.system()
     mode = "quick" if a.quick else ("paths" if a.path else ("full" if a.full else "default"))
     me = os.path.dirname(os.path.abspath(__file__))
     own = (os.path.abspath(__file__), os.path.join(me, "Scan-EmudhraRevoked.ps1"),
            os.path.join(me, "indicators"), os.path.join(me, "tests"))
-    sc = Scanner(ind, a.max_size * 1024 * 1024, a.quiet, exclude=() if a.include_self else own)
     t0 = time.time()
+    sc = Scanner(ind, a.max_size * 1024 * 1024, a.quiet, exclude=() if a.include_self else own,
+                 deadline=(t0 + a.time_limit) if a.time_limit else None)
     if not a.no_trust_stores:
         if not a.quiet:
             sys.stderr.write("Scanning trust stores and certificate bundles...\n")

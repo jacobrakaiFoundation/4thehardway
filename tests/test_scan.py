@@ -11,8 +11,13 @@ import sys
 import tempfile
 import unittest
 import zipfile
+import hashlib
+import re
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import cfb_writer  # noqa: E402
 ROOT = os.path.dirname(HERE)
 SCRIPT = os.path.join(ROOT, "emudhra_scan.py")
 FIX = os.path.join(HERE, "fixtures")
@@ -91,6 +96,8 @@ class TestIndicators(ScanBase):
         self.assertEqual(r.returncode, 0, "run tools/embed_indicators.py after editing indicators.json")
 
     def test_every_indicator_certificate_is_detected(self):
+        """Consistency only: the indicators were built from these same certificates. Their correctness is
+        checked independently against Mozilla's published notice in TestMozillaNotice."""
         names = {e["name"] for e in IND.data["compromised_cas"]}
         roots = {e["name"] for e in IND.data["affected_roots"]}
         seen = set()
@@ -234,6 +241,215 @@ class TestCli(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         rc, out = self.run_cli("--path", ROOT, "--include-self")
         self.assertEqual(rc, 2, out)
+
+
+def msi_streams():
+    """Streams of an MSI-like compound file: a large signature (regular sectors) and a small one (mini stream)."""
+    return [("\x05DigitalSignature", pkcs7([BENIGN_DER, BENIGN_DER, CA_DER, BENIGN_DER])),
+            ("Data", bytes(range(256)) * 80),
+            ("\x05MsiDigitalSignatureEx", pkcs7([LEAF_DER])),
+            ("\x05SummaryInformation", bytes(range(200)) * 7)]
+
+
+class TestOle(ScanBase):
+    def test_streams_are_large_and_small(self):
+        s = dict(msi_streams())
+        self.assertGreaterEqual(len(s["\x05DigitalSignature"]), 4096)      # regular FAT sectors
+        self.assertLess(len(s["\x05MsiDigitalSignatureEx"]), 4096)         # mini stream
+
+    def test_fragmented_v3_needs_reassembly(self):
+        blob = cfb_writer.build(msi_streams(), version=3)
+        raw = [c.subject_cn for c, _ in scan.extract_certs(blob, IND)]
+        self.assertEqual(raw, [], "raw carving should NOT find certificates split across fragmented sectors")
+        got = dict(scan.cfb_signature_streams(blob))
+        want = dict(msi_streams())
+        self.assertEqual(got["DigitalSignature"], want["\x05DigitalSignature"])
+        self.assertEqual(got["MsiDigitalSignatureEx"], want["\x05MsiDigitalSignatureEx"])
+        f = self.scan_blob(blob, "setup.msi")
+        self.assertEqual(sorted((x["kind"], x["indicator"], x["container"]) for x in f), [
+            ("COMPROMISED_CA_CERT", "EM OV CS CA - G3C", "OLE stream: DigitalSignature"),
+            ("ISSUED_BY_COMPROMISED_CA", "EM DV TLS CA - G3B", "OLE stream: MsiDigitalSignatureEx")])
+
+    def test_v4_found_once(self):
+        blob = cfb_writer.build(msi_streams(), version=4)
+        self.assertTrue(any(c.subject_cn == "EM OV CS CA - G3C" for c, _ in scan.extract_certs(blob, IND)),
+                        "4096-byte sectors hold the whole certificate, so raw carving also finds it")
+        f = [x for x in self.scan_blob(blob, "setup.msi") if x["indicator"] == "EM OV CS CA - G3C"]
+        self.assertEqual(len(f), 1, "OLE stream and raw scan of the same file must give one finding")
+        self.assertEqual(f[0]["container"], "OLE stream: DigitalSignature")
+
+    def test_msi_inside_zip(self):
+        bio = io.BytesIO()
+        with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("payload/setup.msi", cfb_writer.build(msi_streams(), version=3))
+        f = self.scan_blob(bio.getvalue(), "bundle.zip")
+        self.assertIn(("COMPROMISED_CA_CERT", "payload/setup.msi!/OLE stream: DigitalSignature"),
+                      [(x["kind"], x["container"]) for x in f])
+
+    def test_olefile_agrees_with_writer_and_reader(self):
+        try:
+            import olefile
+        except ImportError:
+            self.skipTest("olefile not installed (CI installs it)")
+        for ver in (3, 4):
+            blob = cfb_writer.build(msi_streams(), version=ver)
+            ole = olefile.OleFileIO(io.BytesIO(blob))
+            for name, data in msi_streams():
+                self.assertEqual(ole.openstream(name).read(), data, (ver, name))
+            mine = dict(scan.cfb_signature_streams(blob))
+            self.assertEqual(mine["DigitalSignature"], ole.openstream("\x05DigitalSignature").read())
+
+    def test_corrupt_files_do_not_crash(self):
+        good = cfb_writer.build(msi_streams(), version=3)
+        cases = [good[:n] for n in (0, 8, 511, 512, 1024, 1500, 4000, len(good) - 1)]
+        for i in range(300):
+            h = hashlib.sha256(b"mutation %d" % i).digest()
+            b = bytearray(good)
+            for k in range(0, 8, 2):                     # flip 4 bytes in the first 4 KB (header, FAT, directory)
+                pos = int.from_bytes(h[k:k + 2], "big") % 4096
+                b[pos] = h[k + 8]
+            cases.append(bytes(b))
+        for blob in cases:
+            list(scan.cfb_signature_streams(blob))       # must not raise
+            self.scan_blob(blob, "fuzz.msi")
+
+
+class TestListCertsAndTimeLimit(ScanBase):
+    def run_cli(self, *args):
+        r = subprocess.run([sys.executable, SCRIPT] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return r.returncode, r.stdout.decode("utf-8", "replace")
+
+    def test_list_certs_reports_unrelated_certificates(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "setup.msi")
+            with open(p, "wb") as fh:
+                fh.write(cfb_writer.build(msi_streams(), version=3))
+            rc, out = self.run_cli("--list-certs", p, FIX)
+            self.assertEqual(rc, 0, out)
+            certs = json.loads(out)
+            sha1s = {(os.path.basename(c["location"]), c["sha1"]) for c in certs}
+            self.assertIn(("setup.msi", hashlib.sha1(BENIGN_DER).hexdigest()), sha1s)   # benign cert, OLE stream
+            self.assertIn(("benign_ISRG_Root_X1.pem", hashlib.sha1(BENIGN_DER).hexdigest()), sha1s)
+            self.assertIn(("setup.msi", hashlib.sha1(CA_DER).hexdigest()), sha1s)
+
+    def test_deadline_stops_the_walk(self):
+        sc = scan.Scanner(IND, 768 * 1024 * 1024, quiet=True, deadline=time.time() - 1)
+        sc.walk([FIX], "file")
+        self.assertEqual(sc.stats["files_scanned"], 0)
+        self.assertTrue(sc.stats["time_limited"])
+
+    def test_generous_time_limit_completes(self):
+        with tempfile.TemporaryDirectory() as d:     # outside tests/, which the scanner skips as its own files
+            src = os.path.join(d, "src")
+            os.mkdir(src)
+            for p in glob.glob(os.path.join(FIX, "*.pem")):
+                with open(os.path.join(src, os.path.basename(p)), "wb") as fh:
+                    fh.write(rb(p))
+            j = os.path.join(d, "r.json")
+            rc, out = self.run_cli("--no-trust-stores", "--no-processes", "--quiet", "--time-limit", "600",
+                                   "--path", src, "--json", j)
+            with open(j) as fh:
+                doc = json.load(fh)
+            self.assertFalse(doc["stats"]["time_limited"])
+            self.assertGreater(doc["stats"]["files_scanned"], 0)
+
+
+class TestMozillaNotice(unittest.TestCase):
+    """Independent check: compare the indicators with Mozilla's notice to trust store operators
+    (Bug 2083449, attachment 9664786), kept verbatim in tests/published/."""
+
+    @classmethod
+    def setUpClass(cls):
+        text = rb(os.path.join(HERE, "published", "mozilla_notice_bug2083449_attachment9664786.txt")).decode("utf-8")
+        cls.blocks = []
+        cur = None
+        for line in text.splitlines():
+            line = line.strip()
+            m = re.match(r"^(EM (?:DV|OV|EV) TLS CA - G3[BC]|EM OV CS CA - G3[BC])\b.*CCADB (A\d+)$", line)
+            if m:
+                cur = {"name": m.group(1), "ccadb": m.group(2)}
+                cls.blocks.append(cur)
+                continue
+            if cur is None:
+                continue
+            m = re.match(r"^SHA-256 ([0-9A-Fa-f]{64})$", line)
+            if m:
+                cur["sha256"] = m.group(1).lower()
+            m = re.match(r"^SHA256 SPKI ([0-9a-f]{60,64})$", line)
+            if m:
+                cur["spki_prefix"] = m.group(1)
+            m = re.match(r"^serial ([0-9a-f]+)", line)
+            if m:
+                cur["serial"] = m.group(1)
+        cls.roots = {m.group(1): m.group(2) for m in
+                     re.finditer(r"(emSign Root TLS CA - G3|emSign ECC Root CA - G3) \(SPKI SHA-256: ([0-9a-f]{64})\)", text)}
+        cls.ind = {e["name"]: e for e in IND.data["compromised_cas"]}
+
+    def test_notice_parsed(self):
+        self.assertEqual(len(self.blocks), 16, "8 emSign-issued + 8 Sectigo cross-certificates")
+        self.assertEqual(len({b["name"] for b in self.blocks}), 8)
+        self.assertEqual(len(self.roots), 2)
+
+    def test_same_eight_cas(self):
+        self.assertEqual({b["name"] for b in self.blocks}, set(self.ind))
+
+    def test_every_published_certificate_is_an_indicator(self):
+        for b in self.blocks:
+            fps = {c["sha256"] for c in self.ind[b["name"]]["certificates"]}
+            self.assertIn(b["sha256"], fps, b)
+            serials = {c["serial"] for c in self.ind[b["name"]]["certificates"]}
+            self.assertIn(b["serial"].lstrip("0"), serials, b)
+
+    def test_published_key_hashes_match(self):
+        n = 0
+        for b in self.blocks:
+            if "spki_prefix" in b:
+                n += 1
+                self.assertTrue(self.ind[b["name"]]["spki_sha256"].startswith(b["spki_prefix"]), b)
+        self.assertEqual(n, 8)
+
+    def test_root_key_hashes_match(self):
+        roots = {e["name"]: e["spki_sha256"] for e in IND.data["affected_roots"]}
+        for name, spki in self.roots.items():
+            self.assertEqual(roots[name], spki, name)
+
+    def test_shipped_certificate_files_hash_to_published_fingerprints(self):
+        files = {hashlib.sha256(pem_to_der(p)).hexdigest() for p in glob.glob(os.path.join(IND_CERTS, "*.pem"))}
+        for b in self.blocks:
+            self.assertIn(b["sha256"], files, b["name"])
+
+
+class TestCheckReport(unittest.TestCase):
+    def run_check(self, doc, *args):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "r.json")
+            if doc is not None:
+                with open(p, "w") as fh:
+                    fh.write(doc if isinstance(doc, str) else json.dumps(doc))
+            r = subprocess.run([sys.executable, os.path.join(HERE, "check_report.py"), p] + list(args),
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return r.returncode, r.stdout.decode()
+
+    def report(self, certs=120, findings=()):
+        return {"meta": {"version": "x"}, "stats": {"trust_store_sources": 3, "files_scanned": 0,
+                                                     "certificates_parsed": certs}, "findings": list(findings)}
+
+    def test_missing_or_broken_report_fails(self):
+        self.assertEqual(self.run_check(None)[0], 1)
+        self.assertEqual(self.run_check("{not json")[0], 1)
+
+    def test_too_few_certificates_fails(self):
+        self.assertEqual(self.run_check(self.report(certs=3), "--min-certs", "50")[0], 1)
+        self.assertEqual(self.run_check(self.report(certs=120), "--min-certs", "50")[0], 0)
+
+    def test_expectations(self):
+        f = {"severity": "CRITICAL", "kind": "COMPROMISED_CA_CERT", "indicator": "EM DV TLS CA - G3B",
+             "location": "Windows certificate store: CA", "certificate": {"sha256": "a" * 64}}
+        ok = "CRITICAL:COMPROMISED_CA_CERT:EM DV TLS CA - G3B:store: CA"
+        self.assertEqual(self.run_check(self.report(findings=[f]), "--expect", ok)[0], 0)
+        self.assertEqual(self.run_check(self.report(findings=[]), "--expect", ok)[0], 1)
+        one = dict(self.report(), findings=f)          # PowerShell's one-item serialization
+        self.assertEqual(self.run_check(one, "--expect", ok)[0], 0)
 
 
 if __name__ == "__main__":
