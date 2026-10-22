@@ -6,9 +6,12 @@ import importlib.util
 import io
 import json
 import os
+import random
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import zipfile
 import hashlib
@@ -35,9 +38,9 @@ def rb(path):
 
 
 def pem_to_der(path):
-    data = rb(path)
-    m = scan.PEM_RE.search(data)
-    return scan._b64(m.group(2))
+    """DER of the first certificate in a PEM file, decoded here rather than by the scanner under test."""
+    m = re.search(rb"-----BEGIN [A-Z0-9 ]*CERTIFICATE-----(.*?)-----END ", rb(path), re.S)
+    return base64.b64decode(b"".join(m.group(1).split()))
 
 
 def der_len(n):
@@ -89,6 +92,31 @@ def ps1xml_signed(blob):
     return ("<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<Configuration></Configuration>\r\n"
             "<!-- SIG # Begin signature block -->\r\n" + "\r\n".join("<!-- " + l + " -->" for l in _b64_lines(blob)) +
             "\r\n<!-- SIG # End signature block -->\r\n").encode()
+
+
+def mof_signed(blob):
+    """A DSC .mof file: the signature block inside /* */ comments ("/" is a base64 character)."""
+    return ("instance of MSFT_Example\r\n{\r\n};\r\n\r\n/* SIG # Begin signature block */\r\n" +
+            "\r\n".join("/* " + l + " */" for l in _b64_lines(blob)) + "\r\n/* SIG # End signature block */\r\n").encode()
+
+
+def wsh_signed(blob, lang="vbs", utf16=False):
+    """A Windows Script Host script signed by Scripting.Signer: comment lines "'' SIG ''" (VBScript) or "// SIG //"
+    (JScript), 44 base64 characters per line. "SIG" and "/" are base64 characters, so the prefixes must be removed."""
+    pre = "'' SIG '' " if lang == "vbs" else "// SIG // "
+    code = 'WScript.Echo "hi"\r\n' if lang == "vbs" else 'WScript.Echo("hi");\r\n'
+    b64 = base64.b64encode(blob).decode()
+    text = code + "\r\n".join([pre + "Begin signature block"] + [pre + b64[i:i + 44] for i in range(0, len(b64), 44)] +
+                               [pre + "End signature block"]) + "\r\n"
+    return b"\xff\xfe" + text.encode("utf-16-le") if utf16 else text.encode()
+
+
+def wsf_signed(blob):
+    """A .wsf file: the signature is a <signature> element of "** SIG **" lines."""
+    b64 = base64.b64encode(blob).decode()
+    return ('<?xml version="1.0" ?>\r\n<job>\r\n<script language="VBScript">\r\nWScript.Echo "hi"\r\n</script>\r\n'
+            "<signature>\r\n" + "\r\n".join("** SIG ** " + b64[i:i + 44] for i in range(0, len(b64), 44)) +
+            "\r\n</signature>\r\n</job>\r\n").encode()
 
 
 class ScanBase(unittest.TestCase):
@@ -189,6 +217,47 @@ class TestContainers(ScanBase):
         f = self.scan_blob(ps1_signed(pkcs7([CA_DER]), utf16=True), "Module.psd1")
         self.assertEqual([(x["kind"], x["found_as"]) for x in f], [("COMPROMISED_CA_CERT", "powershell-signature")])
 
+    def test_mof_comment_signature_block(self):
+        f = self.scan_blob(mof_signed(pkcs7([CA_DER])), "Resource.schema.mof")
+        self.assertEqual([(x["kind"], x["found_as"]) for x in f], [("COMPROMISED_CA_CERT", "powershell-signature")])
+
+    def test_windows_script_host_signature_blocks(self):
+        for name, data in (("logon.vbs", wsh_signed(pkcs7([CA_DER]), "vbs")),
+                           ("tool.js", wsh_signed(pkcs7([CA_DER]), "js")),
+                           ("unicode.vbs", wsh_signed(pkcs7([CA_DER]), "vbs", utf16=True)),
+                           ("setup.wsf", wsf_signed(pkcs7([CA_DER])))):
+            f = self.scan_blob(data, name)
+            self.assertEqual([(x["kind"], x["found_as"]) for x in f], [("COMPROMISED_CA_CERT", "script-signature")], name)
+
+    def test_signature_like_text_without_a_certificate_is_harmless(self):
+        junk = b"<signature>** SIG ** not base64 at all ~~~~~~~~~~~~~~~~~~~~~~~~</signature>\r\n" \
+               b"# SIG # Begin signature block\r\n# @@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n# SIG # End signature block\r\n"
+        self.assertEqual(self.scan_blob(junk, "odd.ps1"), [])
+
+    def test_unclosed_markers_take_linear_time(self):
+        # A lazy regex rescans up to 400 KB after every begin marker: this file took minutes before.
+        junk = (b"-----BEGIN CERTIFICATE-----\n# SIG # Begin signature block\n<signature>\n'' SIG '' Begin signature block\n"
+                * 6000)
+        t = time.monotonic()
+        self.assertEqual(list(scan.extract_certs(junk, IND, prefilter=False)), [])
+        self.assertLess(time.monotonic() - t, 5)
+
+    def test_blocks_match_the_lazy_regex(self):
+        # find_blocks must return exactly what the lazy regex it replaces returned, on awkward layouts.
+        begin, end = re.compile(b"<b>"), re.compile(b"</b>")
+        lazy = re.compile(b"<b>(.{3,10}?)</b>", re.S)
+        for data in (b"<b>12</b><b>123</b>", b"<b><b>12345</b>", b"<b>1234567890123</b><b>abc</b>", b"<b>abc</b></b>",
+                     b"<b>a</b>bcd</b>", b"x<b>abcd<b>efgh</b>ij</b>", b"<b>" * 5 + b"</b>" * 5, b"<b>abc", b"</b><b>abc</b>"):
+            want = [(m.start(), m.group(1)) for m in lazy.finditer(data)]
+            got = [(m.start(), body) for m, body in scan.find_blocks(data, begin, end, 3, 10)]
+            self.assertEqual(got, want, data)
+        rnd = random.Random(2083449)
+        for _ in range(3000):
+            data = b"".join(rnd.choice((b"<b>", b"</b>", b"x", b"yz", b"<", b"b>")) for _ in range(rnd.randrange(1, 25)))
+            want = [(m.start(), m.group(1)) for m in lazy.finditer(data)]
+            got = [(m.start(), body) for m, body in scan.find_blocks(data, begin, end, 3, 10)]
+            self.assertEqual(got, want, data)
+
     def test_jar_signature_member(self):
         bio = io.BytesIO()
         with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
@@ -279,6 +348,62 @@ def msi_streams():
             ("\x05SummaryInformation", bytes(range(200)) * 7)]
 
 
+def msi_with_decoy(version=3):
+    """A decoy signature-like stream ahead of the real ones, declaring a size larger than the file, so that a
+    reader with a per-file budget would spend it all before reaching the real \x05DigitalSignature."""
+    lay = {}
+    blob = bytearray(cfb_writer.build([("\x05DigitalSignatureDecoy", bytes(range(256)) * 64)] + msi_streams(),
+                                      version=version, layout=lay))
+    struct.pack_into("<Q", blob, lay["entries"][1] + 0x78, 0xFFFFFFFF)
+    return bytes(blob)
+
+
+def msi_with_aliases(version=3, n=150):
+    """n extra signature-like streams that all point into the Data stream's chain, each at a different sector:
+    reading each one in full would cost (chain length)^2."""
+    lay = {}
+    streams = msi_streams() + [("\x05DigitalSignature%03d" % i, b"z") for i in range(n)]
+    blob = bytearray(cfb_writer.build(streams, version=version, layout=lay))
+    data_secs = lay["sectors"][1]                       # streams[1] is "Data"
+    for i in range(n):
+        struct.pack_into("<IQ", blob, lay["entries"][5 + i] + 0x74, data_secs[i % len(data_secs)], 20480)
+    return bytes(blob)
+
+
+def msi_with_difat_loop(mb=8):
+    """A version 3 file padded to `mb` MB whose only DIFAT sector points to itself, with 0xFFFFFFFF FAT and DIFAT
+    sectors declared: a reader that trusts those counts builds a FAT of billions of entries."""
+    blob = bytearray(cfb_writer.build(msi_streams(), version=3).ljust(mb * 1024 * 1024, b"\x00"))
+    x = (len(blob) - 1) // 512 - 1                      # the last sector
+    struct.pack_into("<128I", blob, (x + 1) * 512, *([0] * 127 + [x]))
+    struct.pack_into("<I", blob, 0x2C, 0xFFFFFFFF)
+    struct.pack_into("<II", blob, 0x44, x, 0xFFFFFFFF)
+    return bytes(blob)
+
+
+def msi_with_oversized_signature():
+    """\x05DigitalSignature declares 300 MB, far more than the file holds."""
+    lay = {}
+    blob = bytearray(cfb_writer.build(msi_streams(), version=3, layout=lay))
+    struct.pack_into("<Q", blob, lay["entries"][1] + 0x78, 300 * 1024 * 1024)
+    return bytes(blob)
+
+
+class ReadBudget(bytes):
+    """bytes that fail the test once a reader takes more than `budget` slices of it."""
+    def __new__(cls, data, budget):
+        self = super().__new__(cls, data)
+        self.left = budget
+        return self
+
+    def __getitem__(self, k):
+        if isinstance(k, slice):
+            self.left -= 1
+            if self.left < 0:
+                raise AssertionError("the OLE reader read far more than the file structure needs")
+        return bytes.__getitem__(self, k)
+
+
 class TestOle(ScanBase):
     def test_streams_are_large_and_small(self):
         s = dict(msi_streams())
@@ -342,10 +467,78 @@ class TestOle(ScanBase):
             self.scan_blob(blob, "fuzz.msi")
 
 
+    # Crafted files: the reader must stay linear in the file size and must still find the real signature.
+    # Scan-EmudhraRevoked.ps1 ports the same rules; CI checks both scanners on these files (make_samples.py).
+    def test_difat_loop_is_bounded(self):
+        got = dict(scan.cfb_signature_streams(ReadBudget(msi_with_difat_loop(), 400)))
+        self.assertEqual(got["DigitalSignature"], msi_streams()[0][1])
+
+    def test_aliased_chains_are_bounded(self):
+        blob = msi_with_aliases()
+        got = list(scan.cfb_signature_streams(ReadBudget(blob, 600)))
+        self.assertEqual([n for n, _ in got[:2]], ["DigitalSignature", "MsiDigitalSignatureEx"])
+        self.assertLessEqual(sum(len(b) for _, b in got[2:]), len(blob), "other streams share a budget of the file size")
+
+    def test_decoy_cannot_starve_the_real_signature(self):
+        got = dict(scan.cfb_signature_streams(msi_with_decoy()))
+        self.assertEqual(got["DigitalSignature"], msi_streams()[0][1])
+        f = self.scan_blob(msi_with_decoy(), "setup.msi")
+        self.assertIn(("COMPROMISED_CA_CERT", "OLE stream: DigitalSignature"), [(x["kind"], x["container"]) for x in f])
+
+    def test_real_signature_name_wins_over_an_alias_of_its_chain(self):
+        lay = {}
+        blob = bytearray(cfb_writer.build([("\x05DigitalSignatureCopy", b"z")] + msi_streams(), version=3, layout=lay))
+        alias, real = lay["entries"][1], lay["entries"][2]
+        blob[alias + 0x74:alias + 0x80] = blob[real + 0x74:real + 0x80]            # same start and size
+        self.assertEqual([n for n, _ in scan.cfb_signature_streams(bytes(blob))], ["DigitalSignature", "MsiDigitalSignatureEx"])
+
+    def test_declared_size_is_clamped_to_the_file(self):
+        blob = msi_with_oversized_signature()
+        got = dict(scan.cfb_signature_streams(blob))
+        self.assertTrue(got["DigitalSignature"].startswith(msi_streams()[0][1]))
+        self.assertLessEqual(len(got["DigitalSignature"]), len(blob))
+        # The root's own signature streams do not count against the budget, so the second one is still read.
+        self.assertEqual(got["MsiDigitalSignatureEx"], msi_streams()[2][1])
+
+    def test_chain_stops_at_first_sector_outside_the_file(self):
+        lay = {}
+        blob = bytearray(cfb_writer.build(msi_streams(), version=3, layout=lay))
+        nsect = (len(blob) - 1) // 512
+        self.assertLess(nsect + 2, 128, "the detour sector must still be inside FAT sector 0")
+        secs = lay["sectors"][0]
+        struct.pack_into("<I", blob, lay["fat_offset"] + 4 * secs[0], nsect + 2)      # leave the file...
+        struct.pack_into("<I", blob, lay["fat_offset"] + 4 * (nsect + 2), secs[1])   # ...and come back
+        got = dict(scan.cfb_signature_streams(bytes(blob)))
+        self.assertEqual(got["DigitalSignature"], msi_streams()[0][1][:512])
+
+    def test_sibling_cycle_terminates(self):
+        lay = {}
+        blob = bytearray(cfb_writer.build(msi_streams(), version=3, layout=lay))
+        for i in (1, 2, 3, 4):
+            struct.pack_into("<I", blob, lay["entries"][i] + 0x48, 1)              # every right sibling -> entry 1
+        result = []
+        t = threading.Thread(target=lambda: result.append(dict(scan.cfb_signature_streams(bytes(blob)))), daemon=True)
+        t.start()
+        t.join(5)
+        self.assertFalse(t.is_alive(), "walking a cyclic sibling tree must terminate")
+        self.assertEqual(result[0]["DigitalSignature"], msi_streams()[0][1])
+
+    def test_names_match_ascii_case_insensitively_only(self):
+        sig = msi_streams()[0][1]
+        blob = cfb_writer.build([("\x05dIgItAlSiGnAtUrE2", sig), ("\x05D\u0130gitalSignature", sig)], version=3)
+        self.assertEqual(sorted(dict(scan.cfb_signature_streams(blob))), ["dIgItAlSiGnAtUrE2"])
+
+
 class TestListCertsAndTimeLimit(ScanBase):
     def run_cli(self, *args):
         r = subprocess.run([sys.executable, SCRIPT] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return r.returncode, r.stdout.decode("utf-8", "replace")
+
+    def test_missing_path_is_an_error(self):
+        missing = os.path.join(tempfile.gettempdir(), "4thehardway-no-such-file.msi")
+        for args in (["--no-trust-stores", "--no-processes", "--quiet", "--path", missing], ["--list-certs", missing]):
+            rc, out = self.run_cli(*args)
+            self.assertEqual(rc, 3, "a typo in a path must not look like a clean result: %s" % args)
 
     def test_list_certs_reports_unrelated_certificates(self):
         with tempfile.TemporaryDirectory() as d:

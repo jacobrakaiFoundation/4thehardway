@@ -56,7 +56,7 @@ Other options:
 
 Each finding gives the file or store, the archive member if any, the certificate, and any running processes using that file. Windows also shows the Authenticode signature status. Use `--json` or `-JsonOut` for a machine-readable report.
 
-The exit status is `0` for clean, `1` for warnings only, `2` for critical findings, and `3` for an error.
+The exit status is `0` for clean, `1` for warnings only, `2` for critical findings, and `3` for an error. A path that does not exist is an error, so a typo cannot look like a clean result.
 
 ## What it checks
 
@@ -69,7 +69,7 @@ The exit status is `0` for clean, `1` for warnings only, `2` for critical findin
 **Programs and files.** On Windows these are Program Files, ProgramData, AppData and drivers. On macOS they are `/Applications`, `/Library`, `/usr/local` and `/opt`. On Linux they are `/usr`, `/opt`, `/etc`, `/snap`, Flatpak and `~/.local`. `--full` scans everything instead.
 - Signed executables: PE files such as `.exe`, `.dll` and `.sys`, plus `.cab`, `.cat`, Mach-O and ELF.
 - Windows Installer packages (`.msi`, `.msp`, `.msm`). Their signature streams are reassembled from the OLE file structure, so a signature split across the file is still found.
-- PowerShell signature blocks.
+- Signature blocks in PowerShell files, including `.ps1xml`, `.cdxml` and DSC `.mof` files, and in Windows Script Host files (`.vbs`, `.vbe`, `.wsf`). Signed JScript (`.js`) is read when you name the file with `--path`. It isn't picked by type, because most `.js` files are unsigned web code.
 - Java, Android and Windows app packages, including nested bundles.
 - Certificate files in PEM, DER, PKCS#7, `TRUSTED CERTIFICATE` and JKS formats.
 - Certificates embedded in config files, including JSON-escaped PEM.
@@ -133,18 +133,19 @@ python tools/embed_indicators.py          # after editing indicators/indicators.
 CI runs on Linux, macOS and Windows, with Python 3.9 to 3.13, Windows PowerShell 5.1 and PowerShell 7. Each run checks the following:
 
 - **Indicators against Mozilla's notice.** The indicators are compared with the fingerprints and key hashes in Mozilla's notice to trust store operators, kept verbatim in `tests/published/`.
-- **Sample files.** Both scanners must report exactly the expected findings in the same sample files, including a deliberately fragmented MSI that byte-carving alone misses. The test files are also cross-checked with the independent `olefile` parser.
+- **Sample files.** Both scanners must report exactly the expected findings in the same sample files. These include a deliberately fragmented MSI that byte-carving alone misses, and crafted MSIs that try to slow the scanner down or hide the real signature. The test files are also cross-checked with the independent `olefile` parser.
 - **Real OS stores.** The tests plant compromised certificates and require the scanner to report each one:
   - Windows: the current user's intermediate and `Disallowed` stores.
   - macOS: a keychain added to the search list.
   - Linux: an NSS database made with `certutil` and a Java keystore made with `keytool`.
 - **Real signed files.** The scanner must extract the same signer certificate that the operating system's own tools report:
-  - Windows: `Get-AuthenticodeSignature` on real MSI, EXE, DLL and PowerShell files.
+  - Windows: `Get-AuthenticodeSignature` on real MSI, EXE, DLL and PowerShell files, and on `.cdxml`, `.mof` and VBScript files when the runner has embedded-signed ones. Each file is copied first, so an update that replaces it during the test can't cause a false failure. Windows also signs `.ps1`, `.vbs`, `.js`, `.wsf`, `.cdxml` and `.mof` test files with a throwaway certificate, so the scanner is checked against the formats Windows itself writes.
   - macOS: `codesign` on Apple system binaries.
   - Linux: a JAR signed with `jarsigner` during the test.
+- **Command-line paths.** A path that doesn't exist must be an error, and a relative path must be read from the current directory, including PowerShell's current location.
 - **Real scans with sanity checks.** Each scan must produce a valid report and read a plausible number of certificates from the OS stores. A crash, or a scan that silently reads nothing, fails the build.
 
-The end-to-end store test changes OS certificate stores. It only runs when `E2E_ALLOW_STORE_CHANGES=1` is set, as it is in CI, and it removes everything it adds.
+The end-to-end store test and the Windows signing test change OS certificate stores. They only do so when `E2E_ALLOW_STORE_CHANGES=1` is set, as it is in CI, and they remove everything they add.
 
 ## Credits
 

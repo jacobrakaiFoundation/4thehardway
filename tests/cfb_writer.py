@@ -28,8 +28,12 @@ def _interleave(chains):
     return out, nxt
 
 
-def build(streams, version=3, cutoff=4096):
-    """streams: list of (name, bytes). Returns the compound file as bytes."""
+def build(streams, version=3, cutoff=4096, layout=None):
+    """streams: list of (name, bytes). Returns the compound file as bytes.
+
+    If `layout` is a dict it is filled in for tests that patch the file: "entries" (file offset of each
+    directory entry; entry 0 is the root, entry i + 1 is streams[i]), "sectors" (stream index -> its sectors,
+    for streams stored in regular sectors), "fat_offset" (file offset of FAT entry 0) and "ss" (sector size)."""
     ss = 512 if version == 3 else 4096
     mss = 64
     per = ss // 4
@@ -124,6 +128,13 @@ def build(streams, version=3, cutoff=4096):
         blob = blob[:off] + dentry("", 0, 0, 0) + blob[off + 128:]
     for k, s in enumerate(dir_secs):
         sectors[s][:] = blob[k * ss:(k + 1) * ss]
+    if layout is not None:
+        per_sec = ss // 128
+        layout["ss"] = ss
+        layout["fat_offset"] = ss                   # FAT sector 0 is the first sector after the header
+        layout["entries"] = [(dir_secs[k // per_sec] + 1) * ss + (k % per_sec) * 128 for k in range(ndir * per_sec)]
+        big_idx = [i for i, (_, d) in enumerate(streams) if len(d) >= cutoff]
+        layout["sectors"] = {i: [base + u for u in units] for i, units in zip(big_idx, alloc[:len(big)])}
 
     hdr = bytearray(512)
     hdr[:8] = MAGIC

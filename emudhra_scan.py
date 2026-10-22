@@ -258,14 +258,40 @@ def load_indicators(path=None):
 # ----------------------------------------------------------------------------------------
 
 DER_CERT_RE = re.compile(b"\x30\x82(..)\x30\x82", re.S)
-PEM_RE = re.compile(b"-----BEGIN (X509 CERTIFICATE|TRUSTED CERTIFICATE|CERTIFICATE|PKCS7|CMS)-----"
-                    b"(.{20,200000}?)-----END ", re.S)
-# PowerShell signature blocks: "# SIG # Begin..." in scripts, "<!-- SIG # Begin... -->" in .ps1xml/.cdxml files.
-# The base64 decoder drops the "#", "<!--" and "-->" decorations.
-PS_SIG_RE = re.compile(b"SIG # Begin signature block(.{20,400000}?)SIG # End signature block", re.S)
-PS_SIG_MARK = b"SIG # Begin signature block"
-PS_SIG_MARK_U16 = PS_SIG_MARK.decode().encode("utf-16-le")   # scripts saved as UTF-16 (common in PowerShell 5.1)
+PEM_BEGIN_RE = re.compile(b"-----BEGIN (X509 CERTIFICATE|TRUSTED CERTIFICATE|CERTIFICATE|PKCS7|CMS)-----")
+PEM_END_RE = re.compile(b"-----END ")
+# Signature blocks in script files (Authenticode for scripts), kept in comments:
+#   PowerShell: "# SIG # Begin signature block" in scripts and modules, "<!-- SIG # ... -->" in .ps1xml/.cdxml files,
+#               "/* SIG # ... */" in DSC .mof files.
+#   Windows Script Host: "'' SIG '' Begin signature block" in VBScript, "// SIG // Begin signature block" in JScript,
+#               and a <signature> element of "** SIG **" lines in .wsf files.
+SCRIPT_SIG_BLOCKS = ((re.compile(b"SIG (?:#|''|//) Begin signature block"), re.compile(b"SIG (?:#|''|//) End signature block")),
+                     (re.compile(b"<signature>"), re.compile(b"</signature>")))
+SCRIPT_SIG_MARKS = (b"Begin signature block", b"<signature>")
+SCRIPT_SIG_MARKS_U16 = tuple(m.decode().encode("utf-16-le") for m in SCRIPT_SIG_MARKS)   # scripts saved as UTF-16
+# Line decorations that contain base64 characters ("SIG", "/"); "#", "<!--" and "-->" are dropped with other non-base64.
+SIG_DECORATION_RE = re.compile(rb"'' SIG ''|// SIG //|\*\* SIG \*\*|/\*|\*/")
 B64_JUNK_RE = re.compile(b"\\\\[rn]|[^A-Za-z0-9+/=]")
+
+
+def find_blocks(data, begin_re, end_re, lo, hi):
+    """Yield (begin match, body) for every begin marker whose first end marker starting at least `lo` bytes after
+    it starts at most `hi` bytes after it: what re.finditer(begin + b"(.{lo,hi}?)" + end, re.S) returns, but in
+    linear time. The lazy regex rescans up to `hi` bytes for every begin marker, so a file full of begin markers
+    without end markers would stall the scan for hours. Get-Blocks in Scan-EmudhraRevoked.ps1 is the same."""
+    ends = end_re.finditer(data)
+    e = next(ends, None)
+    pos = 0
+    for b in begin_re.finditer(data):
+        if b.start() < pos:                               # inside the previous block
+            continue
+        while e is not None and e.start() < b.end() + lo:
+            e = next(ends, None)
+        if e is None:
+            return
+        if e.start() - b.end() <= hi:
+            yield b, data[b.end():e.start()]
+            pos = e.end()
 
 
 def _b64(body):
@@ -295,8 +321,8 @@ def extract_certs(data, ind, depth=0, prefilter=True):
     if depth > 2:
         return
     if data.find(b"-----BEGIN ") != -1:
-        for m in PEM_RE.finditer(data):
-            raw = _b64(m.group(2))
+        for m, body in find_blocks(data, PEM_BEGIN_RE, PEM_END_RE, 20, 200000):
+            raw = _b64(body)
             if not raw:
                 continue
             if m.group(1) in (b"PKCS7", b"CMS"):
@@ -312,16 +338,20 @@ def extract_certs(data, ind, depth=0, prefilter=True):
             c = parse_cert(raw)
             if c is not None:
                 yield c, "pem"
-    texts = [data] if data.find(PS_SIG_MARK) != -1 else []
-    u16 = data.find(PS_SIG_MARK_U16)
-    if u16 != -1:
-        texts.append(bytes(data[u16:u16 + 4 * 1024 * 1024]).decode("utf-16-le", "ignore").encode("ascii", "ignore"))
+    texts = [data] if any(data.find(mk) != -1 for mk in SCRIPT_SIG_MARKS) else []
+    for mk in SCRIPT_SIG_MARKS_U16:
+        u16 = data.find(mk)
+        if u16 != -1:
+            start = u16 - 64 if u16 >= 64 else u16 % 2      # include the "SIG # " before the marker; keep the alignment
+            texts.append(bytes(data[start:start + 4 * 1024 * 1024]).decode("utf-16-le", "ignore").encode("ascii", "ignore"))
     for text in texts:
-        for m in PS_SIG_RE.finditer(text):
-            raw = _b64(m.group(1))
-            if raw:
-                for c, how in extract_certs(raw, ind, depth + 1, prefilter):
-                    yield c, "powershell-signature"
+        for begin_re, end_re in SCRIPT_SIG_BLOCKS:
+            for m, body in find_blocks(text, begin_re, end_re, 20, 400000):
+                raw = _b64(SIG_DECORATION_RE.sub(b"", body))
+                if raw:
+                    how = "powershell-signature" if m.group(0).startswith(b"SIG # ") else "script-signature"
+                    for c, _ in extract_certs(raw, ind, depth + 1, prefilter):
+                        yield c, how
 
 
 # ----------------------------------------------------------------------------------------
@@ -330,13 +360,23 @@ def extract_certs(data, ind, depth=0, prefilter=True):
 # ----------------------------------------------------------------------------------------
 
 CFB_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+CFB_SIG_NAMES = ("\x05digitalsignature", "\x05msidigitalsignatureex")   # what Windows Installer verifies
+ASCII_LOWER = {c: c + 32 for c in range(65, 91)}   # lower-case A-Z only, exactly as the PowerShell port does
 
 
-def cfb_signature_streams(data, max_stream=64 * 1024 * 1024):
-    """Yield (stream_name, bytes) for every stream whose name contains "DigitalSignature"."""
+def cfb_signature_streams(data):
+    """Yield (stream_name, bytes) for every stream whose name contains "DigitalSignature".
+
+    The OLE compound file ([MS-CFB]) is read defensively, so a crafted file costs at most linear time and memory:
+    declared sizes are clamped to the file length, each chain is cut at its declared size and at its first
+    sector outside the file, the FAT never covers more sectors than the file has, and the streams returned for
+    one file add up to at most the file's own size. Get-CfbSignatureStreams in Scan-EmudhraRevoked.ps1 is a
+    line-for-line port; keep the two in step.
+    """
     import struct
     try:
-        if len(data) < 1024 or bytes(data[:8]) != CFB_MAGIC:
+        flen = len(data)
+        if flen < 1024 or bytes(data[:8]) != CFB_MAGIC:
             return
         hdr = bytes(data[:512])
         ss = 1 << struct.unpack_from("<H", hdr, 0x1E)[0]
@@ -346,60 +386,99 @@ def cfb_signature_streams(data, max_stream=64 * 1024 * 1024):
         nfat = struct.unpack_from("<I", hdr, 0x2C)[0]
         dir_start = struct.unpack_from("<I", hdr, 0x30)[0]
         cutoff = struct.unpack_from("<I", hdr, 0x38)[0]
-        minifat_start, nminifat, difat_start, ndifat = struct.unpack_from("<4I", hdr, 0x3C)
-        nsect = (len(data) - ss + ss - 1) // ss          # sectors after the header (last may be short)
+        minifat_start, nminifat, difat_start = struct.unpack_from("<3I", hdr, 0x3C)
+        nsect = (flen - 1) // ss                          # sectors after the header (the last may be short)
         per = ss // 4
+        need_fat = min(nfat, -(-nsect // per))            # FAT sectors that can describe a sector of this file
 
-        def sector(n):
-            off = (n + 1) * ss
-            return bytes(data[off:off + ss]).ljust(ss, b"\x00")
-
-        fat_secs = list(struct.unpack_from("<109I", hdr, 0x4C))
-        d, guard = difat_start, 0
-        while d < nsect and guard < min(ndifat, nsect) + 1:
-            vals = struct.unpack("<%dI" % per, sector(d))
-            fat_secs += vals[:-1]
-            d, guard = vals[-1], guard + 1
-        fat = []
-        for fs in fat_secs[:nfat]:      # an invalid FAT sector keeps its slot (as free entries) so indices stay aligned
-            fat += struct.unpack("<%dI" % per, sector(fs)) if fs < nsect else (0xFFFFFFFF,) * per
+        def units(src, chain_, unit, skip, size):
+            """Join `unit`-byte units of src along chain_ (offset by `skip` units), up to size bytes.
+            Stops at the first unit outside src; a short last unit is zero-padded."""
+            out, total = [], 0
+            for n in chain_:
+                off = (n + skip) * unit
+                if total >= size or off >= len(src):
+                    break
+                out.append(bytes(src[off:off + unit]).ljust(unit, b"\x00"))
+                total += unit
+            return b"".join(out)[:size]
 
         def chain(start, table, limit):
             out, n, seen = [], start, set()
-            while n < len(table) and n not in seen and len(out) < limit:
+            while n < len(table) and len(out) < limit and n not in seen:
                 seen.add(n)
                 out.append(n)
                 n = table[n]
             return out
 
-        def read_chain(start, size):
-            return b"".join(sector(s) for s in chain(start, fat, nsect) if s < nsect)[:size]
+        fat_secs = list(struct.unpack_from("<109I", hdr, 0x4C))
+        d, seen_d = difat_start, set()
+        while len(fat_secs) < need_fat and d < nsect and d not in seen_d:
+            seen_d.add(d)
+            vals = struct.unpack("<%dI" % per, units(data, [d], ss, 1, ss))
+            fat_secs += vals[:-1]
+            d = vals[-1]
+        fat = []
+        for fs in fat_secs[:need_fat]:  # an invalid FAT sector keeps its slot (as free entries) so indices stay aligned
+            fat += struct.unpack("<%dI" % per, units(data, [fs], ss, 1, ss)) if fs < nsect else (0xFFFFFFFF,) * per
 
-        dirs = read_chain(dir_start, nsect * ss)
-        entries = []
-        for i in range(0, len(dirs) - 127, 128):
-            e = dirs[i:i + 128]
-            nlen = struct.unpack_from("<H", e, 0x40)[0]
-            name = e[:nlen - 2].decode("utf-16-le", "replace") if 2 <= nlen <= 64 else ""
-            size = struct.unpack_from("<Q", e, 0x78)[0]
+        dirs = units(data, chain(dir_start, fat, nsect), ss, 1, nsect * ss)
+        count = len(dirs) // 128
+        if count == 0 or dirs[0x42] != 5:                   # entry 0 must be the root storage
+            return
+
+        def name_of(k):
+            nlen = struct.unpack_from("<H", dirs, k * 128 + 0x40)[0]
+            return dirs[k * 128:k * 128 + nlen - 2].decode("utf-16-le", "replace") if 2 <= nlen <= 64 else ""
+
+        def size_of(k):
+            size = struct.unpack_from("<Q", dirs, k * 128 + 0x78)[0]
             if ss == 512:
                 size &= 0xFFFFFFFF                          # version 3 files: high dword is undefined
-            entries.append((name, e[0x42], struct.unpack_from("<I", e, 0x74)[0], size))
-        if not entries or entries[0][1] != 5:               # entry 0 must be the root storage
-            return
-        ministream = minifat = None
-        for name, typ, start, size in entries[1:]:
-            if typ != 2 or "digitalsignature" not in name.lower() or not 0 < size <= max_stream:
+            return min(size, flen)                          # no stream can be longer than the file
+
+        # The root storage's own \x05DigitalSignature and \x05MsiDigitalSignatureEx are always read, first.
+        # Any other stream whose name mentions DigitalSignature (nested storages, unusual names) is read too, but
+        # a chain already read is skipped and those streams together return at most the file's size, so decoy
+        # streams can neither blow up the work nor use up the budget before the real signature is read.
+        top, todo, kids = {}, [struct.unpack_from("<I", dirs, 0x4C)[0]], set()
+        while todo:                                         # walk the root storage's children (a sibling tree)
+            k = todo.pop()
+            if k >= count or k in kids:
                 continue
+            kids.add(k)
+            todo += struct.unpack_from("<II", dirs, k * 128 + 0x44)      # left and right siblings
+            low = name_of(k).translate(ASCII_LOWER)
+            if dirs[k * 128 + 0x42] == 2 and low in CFB_SIG_NAMES and k < top.get(low, count):
+                top[low] = k
+        first = sorted(top.values())
+        ministream = minifat = None
+        done, total = set(), 0
+        for k in first + [k for k in range(1, count) if k not in first]:
+            if dirs[k * 128 + 0x42] != 2:                   # streams only
+                continue
+            name = name_of(k)
+            if "digitalsignature" not in name.translate(ASCII_LOWER):
+                continue
+            start, size = struct.unpack_from("<I", dirs, k * 128 + 0x74)[0], size_of(k)
+            key = (start, size, size < cutoff)
+            if size == 0 or key in done:
+                continue
+            if k not in first:
+                if total + size > flen:
+                    continue
+                total += size
+            done.add(key)
             if size < cutoff:
                 if ministream is None:
-                    ministream = read_chain(entries[0][2], entries[0][3])
-                    mf = read_chain(minifat_start, nminifat * ss) if minifat_start < nsect else b""
+                    root_start, root_size = struct.unpack_from("<I", dirs, 0x74)[0], size_of(0)
+                    ministream = units(data, chain(root_start, fat, -(-root_size // ss)), ss, 1, root_size)
+                    nmf = min(nminifat, nsect)
+                    mf = units(data, chain(minifat_start, fat, nmf), ss, 1, nmf * ss)
                     minifat = struct.unpack("<%dI" % (len(mf) // 4), mf[:len(mf) // 4 * 4])
-                secs = chain(start, minifat, len(ministream) // mss + 1)
-                buf = b"".join(ministream[s * mss:(s + 1) * mss] for s in secs)[:size]
+                buf = units(ministream, chain(start, minifat, -(-size // mss)), mss, 0, size)
             else:
-                buf = read_chain(start, size)
+                buf = units(data, chain(start, fat, -(-size // ss)), ss, 1, size)
             yield re.sub(r"[\x00-\x1f]", "", name), buf
     except (struct.error, IndexError, ValueError, OverflowError, MemoryError):
         return
@@ -411,7 +490,7 @@ def cfb_signature_streams(data, max_stream=64 * 1024 * 1024):
 
 SIGNED_EXTS = {".exe", ".dll", ".sys", ".ocx", ".cpl", ".scr", ".efi", ".mui", ".drv", ".com",
                ".msi", ".msp", ".msm", ".cab", ".cat", ".ps1", ".psm1", ".psd1", ".ps1xml",
-               ".psc1", ".vbs", ".wsf", ".appx", ".msix", ".appxbundle", ".msixbundle", ".jar",
+               ".psc1", ".cdxml", ".mof", ".vbs", ".vbe", ".wsf", ".appx", ".msix", ".appxbundle", ".msixbundle", ".jar",
                ".war", ".ear", ".apk", ".aab", ".xpi", ".vsix", ".nupkg", ".so", ".dylib",
                ".node", ".bundle", ".kext", ".pkg", ".winmd", ".xll", ".sst", ".stl", ".p7x", ".asar"}
 CERT_EXTS = {".pem", ".crt", ".cer", ".der", ".cert", ".p7b", ".p7c", ".p7s", ".spc", ".pfx",
@@ -564,7 +643,7 @@ class Scanner(object):
                     data = fh.read()
                 try:
                     if data[:8] == CFB_MAGIC:
-                        for name, buf in cfb_signature_streams(data, self.max_size):
+                        for name, buf in cfb_signature_streams(data):
                             self.stats["ole_signature_streams"] += 1
                             self.scan_bytes(buf, path, source, container=OLE_PREFIX + name)
                     self.scan_bytes(data, path, source)
@@ -599,7 +678,7 @@ class Scanner(object):
                     data = zf.read(zi)
                     if interesting:
                         if data[:8] == CFB_MAGIC:
-                            for sname, buf in cfb_signature_streams(data, self.max_size):
+                            for sname, buf in cfb_signature_streams(data):
                                 self.stats["ole_signature_streams"] += 1
                                 self.scan_bytes(buf, location, source, container=member + "!/" + OLE_PREFIX + sname)
                         self.scan_bytes(data, location, source, container=member)
@@ -844,8 +923,8 @@ def running_process_paths():
 def self_test(ind):
     """Check the engine on a known compromised CA certificate in several encodings."""
     pem = SELFTEST_PEM
-    m = PEM_RE.search(pem)
-    der = _b64(m.group(2)) if m else b""
+    m = next(find_blocks(pem, PEM_BEGIN_RE, PEM_END_RE, 20, 200000), None)
+    der = _b64(m[1]) if m else b""
     c = parse_cert(der)
     ok = c is not None and ind.classify(c) is not None and ind.classify(c)[0] == "COMPROMISED_CA_CERT"
     blob = os.urandom(4096) + der + os.urandom(4096)
@@ -921,7 +1000,12 @@ def main(argv=None):
             print("%-22s %s" % (k, "ok" if v else "FAILED"))
         print("self-test %s" % ("passed" if ok else "FAILED"))
         return 0 if ok else 3
-    if a.list_certs:
+    # A path that does not exist is an error, so that a typo cannot look like a clean result.
+    missing = [p for p in (a.list_certs or a.path) if not os.path.exists(p)]
+    if missing:
+        sys.stderr.write("error: path not found: %s\n" % ", ".join(missing))
+        return 3
+    if a.list_certs:                                    # every certificate, no prefilter and no --time-limit
         sc = Scanner(ind, a.max_size * 1024 * 1024, quiet=True, collect_all=True)
         for p in a.list_certs:
             if os.path.isdir(p):

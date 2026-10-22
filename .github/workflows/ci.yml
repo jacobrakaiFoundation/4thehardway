@@ -51,6 +51,9 @@ jobs:
           set -e
           test "$rc" -eq 2
           python tests/compare_reports.py samples/expected.json py-samples.json
+      - name: Command-line paths (a missing path is an error, relative paths resolve)
+        shell: bash
+        run: python tests/cli_paths.py --scanner python samples
 
       - name: Quick scan reads this runner's real trust stores
         shell: bash
@@ -77,6 +80,8 @@ jobs:
 
       - name: Signer certificates are extracted from real signed files
         shell: bash
+        env:
+          E2E_ALLOW_STORE_CHANGES: "1"   # Windows: sign test scripts with a throwaway certificate in CurrentUser\My
         run: |
           extra=""
           if [ "$RUNNER_OS" = "Windows" ]; then extra="--require-msi"; fi
@@ -129,6 +134,9 @@ jobs:
           set -e
           test "$rc" -eq 2
           python tests/compare_reports.py samples/expected.json ps-samples.json
+      - name: Command-line paths (a missing path is an error, relative paths resolve)
+        shell: bash
+        run: python tests/cli_paths.py --scanner ${{ matrix.shell }} samples
 
       - name: Quick scan reads this runner's real certificate stores
         shell: bash
@@ -149,6 +157,8 @@ jobs:
 
       - name: Signer certificates are extracted from real signed files
         shell: bash
+        env:
+          E2E_ALLOW_STORE_CHANGES: "1"   # sign test scripts with a throwaway certificate in CurrentUser\My
         run: python tests/real_signed_files.py --scanner ${{ matrix.shell }} --require-msi
 
       - name: Default scan of this runner (time-limited)
