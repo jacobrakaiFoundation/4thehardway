@@ -31,6 +31,8 @@ param(
     [int]$MaxSizeMB = 256,
     [switch]$NoProcesses,
     [switch]$IncludeSelf,
+    [int]$TimeLimitSec = 0,
+    [switch]$ListCerts,
     [switch]$SelfTest,
     [switch]$Quiet
 )
@@ -70,7 +72,35 @@ gt2TlfJbHii+KNvK
 
 $OnWindows = ($PSVersionTable.PSEdition -eq 'Desktop') -or ((Test-Path variable:IsWindows) -and $IsWindows)
 $Latin1 = [System.Text.Encoding]::GetEncoding(28591)
+# Signature blocks in script files (see SCRIPT_SIG_RE in emudhra_scan.py): PowerShell "# SIG #" in scripts, "<!-- -->" in
+# .ps1xml/.cdxml, "/* */" in .mof; Windows Script Host "'' SIG ''" (VBScript), "// SIG //" (JScript), <signature> (.wsf).
+$SigMarks = @('Begin signature block', '<signature>')
+$SigMarksU16 = @($SigMarks | ForEach-Object { $Latin1.GetString([System.Text.Encoding]::Unicode.GetBytes($_)) })   # UTF-16LE, seen through Latin-1
+# The end marker takes its line's "// " or "'' " with it: "/" is a base64 character (see emudhra_scan.py).
+$SigBlocks = @(@("SIG (?:#|''|//) Begin signature block", "(?:// |'' )?SIG (?:#|''|//) End signature block"), @('<signature>', '</signature>'))
+$PemBeginPattern = '-----BEGIN (X509 CERTIFICATE|TRUSTED CERTIFICATE|CERTIFICATE|PKCS7|CMS)-----'
+$SigDecorationPattern = "'' SIG ''|// SIG //|\*\* SIG \*\*|/\*|\*/"   # decorations made of base64 characters ("SIG", "/")
 $Sha256 = [System.Security.Cryptography.SHA256]::Create()
+
+# Like [regex]::Matches($text, $begin + '([\s\S]{lo,hi}?)' + $end) but in linear time: for each begin marker, the first
+# end marker starting at least $lo characters after it, if it starts at most $hi after it. Same as find_blocks in
+# emudhra_scan.py; the lazy regex rescans up to $hi characters per begin marker, which a crafted file can exploit.
+function Get-Blocks([string]$text, [string]$begin, [string]$end, [int]$lo, [int]$hi) {
+    $out = New-Object System.Collections.ArrayList
+    $e = ([regex]$end).Match($text)
+    $pos = 0
+    foreach ($b in [regex]::Matches($text, $begin)) {
+        if ($b.Index -lt $pos) { continue }                       # inside the previous block
+        $bend = $b.Index + $b.Length
+        while ($e.Success -and $e.Index -lt $bend + $lo) { $e = $e.NextMatch() }
+        if (-not $e.Success) { break }
+        if ($e.Index - $bend -le $hi) {
+            [void]$out.Add(@{ Begin = $b; Body = $text.Substring($bend, $e.Index - $bend) })
+            $pos = $e.Index + $e.Length
+        }
+    }
+    return , $out
+}
 
 function ConvertTo-Hex([byte[]]$b) { if ($null -eq $b) { return '' }; return ([BitConverter]::ToString($b)).Replace('-', '').ToLowerInvariant() }
 
@@ -153,12 +183,14 @@ function Get-B64Bytes([string]$body) {
 }
 
 # Returns a list of @{Cert; How} for every certificate inside $bytes.
-function Find-Certs([byte[]]$bytes, [int]$depth = 0) {
+# With $prefilter (normal scans), raw DER is only carved when the bytes contain the name of a compromised CA
+# or affected root; every relevant certificate carries one as subject or issuer. -ListCerts turns it off.
+function Find-Certs([byte[]]$bytes, [int]$depth = 0, [bool]$prefilter = $true) {
     $out = New-Object System.Collections.ArrayList
     if ($null -eq $bytes -or $bytes.Length -lt 64) { return , $out }
     $s = $Latin1.GetString($bytes)
-    $hit = $false
-    foreach ($m in $Markers) { if ($s.IndexOf($m, [StringComparison]::Ordinal) -ge 0) { $hit = $true; break } }
+    $hit = -not $prefilter
+    if (-not $hit) { foreach ($m in $Markers) { if ($s.IndexOf($m, [StringComparison]::Ordinal) -ge 0) { $hit = $true; break } } }
     if ($hit) {
         foreach ($m in [regex]::Matches($s, '\x30\x82[\s\S]{2}\x30\x82')) {
             $i = $m.Index; $len = ($bytes[$i + 2] * 256) + $bytes[$i + 3] + 4
@@ -170,12 +202,12 @@ function Find-Certs([byte[]]$bytes, [int]$depth = 0) {
     }
     if ($depth -gt 2) { return , $out }
     if ($s.IndexOf('-----BEGIN ', [StringComparison]::Ordinal) -ge 0) {
-        foreach ($m in [regex]::Matches($s, '-----BEGIN (X509 CERTIFICATE|TRUSTED CERTIFICATE|CERTIFICATE|PKCS7|CMS)-----([\s\S]{20,200000}?)-----END ')) {
-            $raw = Get-B64Bytes $m.Groups[2].Value
+        foreach ($blk in (Get-Blocks $s $PemBeginPattern '-----END ' 20 200000)) {
+            $raw = Get-B64Bytes $blk.Body
             if ($null -eq $raw -or $raw.Length -eq 0) { continue }
-            $kind = $m.Groups[1].Value
+            $kind = $blk.Begin.Groups[1].Value
             if ($kind -eq 'PKCS7' -or $kind -eq 'CMS') {
-                foreach ($x in (Find-Certs $raw ($depth + 1))) { $x.How = 'pem-pkcs7'; [void]$out.Add($x) }
+                foreach ($x in (Find-Certs $raw ($depth + 1) $prefilter)) { $x.How = 'pem-pkcs7'; [void]$out.Add($x) }
                 continue
             }
             if ($kind -eq 'TRUSTED CERTIFICATE') {
@@ -187,28 +219,220 @@ function Find-Certs([byte[]]$bytes, [int]$depth = 0) {
             if ($c) { [void]$out.Add(@{ Cert = $c; How = 'pem' }) }
         }
     }
-    if ($s.IndexOf('# SIG # Begin signature block', [StringComparison]::Ordinal) -ge 0) {
-        foreach ($m in [regex]::Matches($s, '# SIG # Begin signature block([\s\S]{20,400000}?)# SIG # End signature block')) {
-            $body = [regex]::Replace($m.Groups[1].Value, '(?m)^#\s?', '')
-            $raw = Get-B64Bytes $body
-            if ($raw) { foreach ($x in (Find-Certs $raw ($depth + 1))) { $x.How = 'powershell-signature'; [void]$out.Add($x) } }
+    # Script signature blocks, also in files saved as UTF-16. Get-B64Bytes drops "#", "<!--", "-->" and other non-base64.
+    $texts = New-Object System.Collections.ArrayList
+    foreach ($mk in $SigMarks) { if ($s.IndexOf($mk, [StringComparison]::Ordinal) -ge 0) { [void]$texts.Add($s); break } }
+    foreach ($mk in $SigMarksU16) {
+        $u16 = $s.IndexOf($mk, [StringComparison]::Ordinal)
+        if ($u16 -ge 0) {
+            $st = $u16 % 2; if ($u16 -ge 64) { $st = $u16 - 64 }     # include the "SIG # " before the marker; keep the alignment
+            $count = [int][math]::Min($bytes.Length - $st, 4MB); $count -= $count % 2
+            [void]$texts.Add([System.Text.Encoding]::Unicode.GetString($bytes, $st, $count))
         }
     }
+    foreach ($text in $texts) {
+        foreach ($pair in $SigBlocks) {
+            foreach ($blk in (Get-Blocks $text $pair[0] $pair[1] 20 400000)) {
+                $raw = Get-B64Bytes ([regex]::Replace($blk.Body, $SigDecorationPattern, ''))
+                if ($raw) {
+                    $how = 'script-signature'; if ($blk.Begin.Value.StartsWith('SIG # ', [StringComparison]::Ordinal)) { $how = 'powershell-signature' }
+                    foreach ($x in (Find-Certs $raw ($depth + 1) $prefilter)) { $x.How = $how; [void]$out.Add($x) }
+                }
+            }
+        }
+    }
+    return , $out
+}
+
+# ---- OLE compound files (MSI, MSP, MSM, Office) -----------------------------------------------------
+# Signature streams can be split across non-contiguous sectors, so they are reassembled by following the
+# FAT chain ([MS-CFB]), mirroring cfb_signature_streams in emudhra_scan.py.
+$OlePrefix = 'OLE stream: '
+$U32Max = [uint32]4294967295
+$CfbSigNames = @("$([char]5)digitalsignature", "$([char]5)msidigitalsignatureex")   # what Windows Installer verifies
+
+function Get-CfbChain($table, [uint32]$start, [int64]$limit) {
+    $list = New-Object System.Collections.Generic.List[uint32]
+    $seen = New-Object System.Collections.Generic.HashSet[uint32]
+    $n = $start
+    while ($n -lt $table.Length -and $list.Count -lt $limit -and $seen.Add($n)) { $list.Add($n); $n = $table[$n] }
+    return , $list
+}
+
+function Read-CfbBytes([byte[]]$src, $chain, [int]$unit, [int]$headerUnits, [int64]$size) {
+    $ms = New-Object System.IO.MemoryStream
+    foreach ($s in $chain) {
+        if ($ms.Length -ge $size) { break }
+        $off = ([int64]$s + $headerUnits) * $unit
+        if ($off -ge $src.Length) { break }
+        $len = [int][math]::Min([int64]$unit, $src.Length - $off)
+        $ms.Write($src, [int]$off, $len)
+        if ($len -lt $unit) { $pad = New-Object byte[] ($unit - $len); $ms.Write($pad, 0, $pad.Length) }
+    }
+    $arr = $ms.ToArray()
+    if ($arr.Length -gt $size) { $tmp = New-Object byte[] ([int]$size); [Array]::Copy($arr, $tmp, [int]$size); $arr = $tmp }
+    return , $arr
+}
+
+function ConvertTo-U32Array([byte[]]$b) {
+    $n = [int][math]::Floor($b.Length / 4)
+    $a = New-Object 'uint32[]' $n
+    if ($n -gt 0) { [Buffer]::BlockCopy($b, 0, $a, 0, $n * 4) }
+    return , $a
+}
+
+function Get-CfbName([byte[]]$dirs, [int]$off) {
+    $nlen = [BitConverter]::ToUInt16($dirs, $off + 0x40)
+    if ($nlen -lt 2 -or $nlen -gt 64) { return '' }
+    return [System.Text.Encoding]::Unicode.GetString($dirs, $off, $nlen - 2)
+}
+
+# Lower-cases A-Z only, so both scanners match names the same way whatever Unicode casing rules say.
+function ConvertTo-AsciiLower([string]$s) {
+    if ($s -cnotmatch '[^\x00-\x7F]') { return $s.ToLowerInvariant() }
+    $c = $s.ToCharArray()
+    for ($i = 0; $i -lt $c.Length; $i++) { $v = [int]$c[$i]; if ($v -ge 65 -and $v -le 90) { $c[$i] = [char]($v + 32) } }
+    return -join $c
+}
+
+function Get-CfbEntrySize([byte[]]$dirs, [int]$off, [int]$ss, [int64]$flen) {
+    $size = [BitConverter]::ToUInt64($dirs, $off + 0x78)
+    if ($ss -eq 512) { $size = $size -band [uint64]4294967295 }   # version 3: high dword undefined
+    if ($size -gt [uint64]$flen) { return $flen }                 # no stream can be longer than the file
+    return [int64]$size
+}
+
+# Returns a list of @{ Name; Bytes } for every stream whose name contains "DigitalSignature".
+# A line-for-line port of cfb_signature_streams in emudhra_scan.py, with the same limits: sizes clamped to the
+# file length, chains cut at their declared size and at the first sector outside the file, the FAT bounded by the
+# file's sector count, and at most the file's own size returned in total. Keep the two in step.
+function Get-CfbSignatureStreams([byte[]]$b) {
+    $out = New-Object System.Collections.ArrayList
+    try {
+        if ($b.Length -lt 1024 -or $b[0] -ne 0xD0 -or $b[1] -ne 0xCF -or $b[2] -ne 0x11 -or $b[3] -ne 0xE0 -or
+            $b[4] -ne 0xA1 -or $b[5] -ne 0xB1 -or $b[6] -ne 0x1A -or $b[7] -ne 0xE1) { return , $out }
+        $shift = [BitConverter]::ToUInt16($b, 0x1E); $mshift = [BitConverter]::ToUInt16($b, 0x20)
+        if (($shift -ne 9 -and $shift -ne 12) -or $mshift -ne 6) { return , $out }
+        $ss = [int](1 -shl $shift); $mss = 64; $per = [int]($ss / 4)
+        $nfat = [BitConverter]::ToUInt32($b, 0x2C); $dirStart = [BitConverter]::ToUInt32($b, 0x30)
+        $cutoff = [BitConverter]::ToUInt32($b, 0x38)
+        $mfStart = [BitConverter]::ToUInt32($b, 0x3C); $nmf = [BitConverter]::ToUInt32($b, 0x40)
+        $difStart = [BitConverter]::ToUInt32($b, 0x44)
+        $flen = [int64]$b.Length
+        $nsect = [int64][math]::Floor(($flen - 1) / $ss)
+        $needFat = [math]::Min([int64]$nfat, [int64][math]::Ceiling($nsect / $per))
+        $fatSecs = New-Object System.Collections.Generic.List[uint32]
+        for ($i = 0; $i -lt 109; $i++) { $fatSecs.Add([BitConverter]::ToUInt32($b, 0x4C + 4 * $i)) }
+        $d = $difStart
+        $seenDif = New-Object System.Collections.Generic.HashSet[uint32]
+        while ($fatSecs.Count -lt $needFat -and $d -lt $nsect -and $seenDif.Add($d)) {
+            $vals = ConvertTo-U32Array (Read-CfbBytes $b @($d) $ss 1 $ss)
+            for ($i = 0; $i -lt $per - 1; $i++) { $fatSecs.Add($vals[$i]) }
+            $d = $vals[$per - 1]
+        }
+        $useFat = [int][math]::Min($needFat, [int64]$fatSecs.Count)
+        $fat = New-Object 'uint32[]' ($useFat * $per)
+        for ($i = 0; $i -lt $useFat; $i++) {
+            $fs = $fatSecs[$i]
+            if ($fs -lt $nsect) {
+                $sec = Read-CfbBytes $b @($fs) $ss 1 $ss
+                [Buffer]::BlockCopy($sec, 0, $fat, $i * $ss, $ss)
+            } else {
+                for ($k = 0; $k -lt $per; $k++) { $fat[$i * $per + $k] = $U32Max }   # keep indices aligned
+            }
+        }
+        $dirs = Read-CfbBytes $b (Get-CfbChain $fat $dirStart $nsect) $ss 1 ($nsect * $ss)
+        $count = [int][math]::Floor($dirs.Length / 128)
+        if ($count -eq 0 -or $dirs[0x42] -ne 5) { return , $out }              # entry 0 must be the root storage
+        # The root storage's own signature streams are always read, first; other streams that mention
+        # DigitalSignature share a budget of the file's size (see cfb_signature_streams in emudhra_scan.py).
+        $top = @{}
+        $kids = New-Object System.Collections.Generic.HashSet[uint32]
+        $todo = New-Object System.Collections.Generic.Stack[uint32]
+        $todo.Push([BitConverter]::ToUInt32($dirs, 0x4C))
+        while ($todo.Count -gt 0) {                                             # the root's children (a sibling tree)
+            $k = $todo.Pop()
+            if ($k -ge $count -or -not $kids.Add($k)) { continue }
+            $o = [int]$k * 128
+            $todo.Push([BitConverter]::ToUInt32($dirs, $o + 0x44)); $todo.Push([BitConverter]::ToUInt32($dirs, $o + 0x48))
+            $low = ConvertTo-AsciiLower (Get-CfbName $dirs $o)
+            if ($dirs[$o + 0x42] -eq 2 -and $CfbSigNames -ccontains $low -and (-not $top.ContainsKey($low) -or [int]$k -lt $top[$low])) { $top[$low] = [int]$k }
+        }
+        $first = New-Object System.Collections.Generic.List[int]
+        foreach ($v in $top.Values) { $first.Add([int]$v) }
+        $first.Sort()
+        $order = New-Object System.Collections.Generic.List[int]
+        $order.AddRange($first)
+        for ($k = 1; $k -lt $count; $k++) { if (-not $first.Contains($k)) { $order.Add($k) } }
+        $mini = $null; $minifat = $null; $done = @{}; $total = [int64]0
+        foreach ($k in $order) {
+            $o = $k * 128
+            if ($dirs[$o + 0x42] -ne 2) { continue }                            # streams only
+            $name = Get-CfbName $dirs $o
+            if ((ConvertTo-AsciiLower $name).IndexOf('digitalsignature', [StringComparison]::Ordinal) -lt 0) { continue }
+            $start = [BitConverter]::ToUInt32($dirs, $o + 0x74); $size = Get-CfbEntrySize $dirs $o $ss $flen
+            $isMini = $size -lt $cutoff
+            $key = "$start|$size|$isMini"
+            if ($size -eq 0 -or $done.ContainsKey($key)) { continue }
+            if (-not $first.Contains($k)) {
+                if ($total + $size -gt $flen) { continue }
+                $total += $size
+            }
+            $done[$key] = $true
+            if ($isMini) {
+                if ($null -eq $mini) {
+                    $rootSize = Get-CfbEntrySize $dirs 0 $ss $flen
+                    $mini = Read-CfbBytes $b (Get-CfbChain $fat ([BitConverter]::ToUInt32($dirs, 0x74)) ([int64][math]::Ceiling($rootSize / $ss))) $ss 1 $rootSize
+                    $nmfUse = [math]::Min([int64]$nmf, $nsect)
+                    $minifat = ConvertTo-U32Array (Read-CfbBytes $b (Get-CfbChain $fat $mfStart $nmfUse) $ss 1 ($nmfUse * $ss))
+                }
+                $buf = Read-CfbBytes $mini (Get-CfbChain $minifat $start ([int64][math]::Ceiling($size / $mss))) $mss 0 $size
+            } else {
+                $buf = Read-CfbBytes $b (Get-CfbChain $fat $start ([int64][math]::Ceiling($size / $ss))) $ss 1 $size
+            }
+            [void]$out.Add(@{ Name = [regex]::Replace($name, '[\x00-\x1f]', ''); Bytes = $buf })
+        }
+    } catch { }
     return , $out
 }
 
 # ---- findings --------------------------------------------------------------------------------------
 $Findings = New-Object System.Collections.ArrayList
 $Seen = @{}
-$Stats = [ordered]@{ trust_store_sources = 0; files_scanned = 0; files_skipped_size = 0; files_unreadable = 0; bytes_scanned = 0; certificates_parsed = 0 }
+$Stats = [ordered]@{ trust_store_sources = 0; files_scanned = 0; files_skipped_size = 0; files_unreadable = 0; bytes_scanned = 0; certificates_parsed = 0
+    ole_signature_streams = 0; time_limited = $false }
+$CollectAll = [bool]$ListCerts          # -ListCerts: record every certificate and skip the prefilter
+$AllCerts = New-Object System.Collections.ArrayList
+$AllSeen = @{}
+
+function Get-CertSummary($c, [string]$sha) {
+    return [ordered]@{ subject_cn = (Get-CN $c.Subject); issuer_cn = (Get-CN $c.Issuer); serial = $c.SerialNumber.ToLowerInvariant()
+        not_before = $c.NotBefore.ToUniversalTime().ToString('s') + 'Z'; not_after = $c.NotAfter.ToUniversalTime().ToString('s') + 'Z'
+        sha256 = $sha; sha1 = $c.Thumbprint.ToLowerInvariant() }
+}
 
 function Add-Finding($c, [string]$location, [string]$source, [string]$container, [string]$how, [string]$store) {
     $Stats.certificates_parsed++
+    $sha = ConvertTo-Hex ($Sha256.ComputeHash($c.RawData))
+    if ($CollectAll) {
+        $ak = "$location|$container|$sha"
+        if (-not $AllSeen.ContainsKey($ak)) {
+            $AllSeen[$ak] = $true
+            $rec = Get-CertSummary $c $sha
+            $rec.location = $location; $rec.container = $container; $rec.found_as = $how; $rec.store = $store
+            [void]$AllCerts.Add($rec)
+        }
+    }
     $cls = Get-Classification $c
     if ($null -eq $cls) { return }
     $kind = $cls[0]; $e = $cls[1]
-    $sha = ConvertTo-Hex ($Sha256.ComputeHash($c.RawData))
-    $key = "$location|$container|$sha|$kind"
+    # A certificate found both in a reassembled OLE stream and by the raw scan of the same file is one finding;
+    # the OLE stream (scanned first) supplies the container name.
+    $ckey = $container
+    if ($container -and $container.Contains($OlePrefix)) {
+        $ckey = $container.Substring(0, $container.IndexOf($OlePrefix)).TrimEnd('!', '/')
+    }
+    $key = "$location|$ckey|$sha|$kind"
     if ($Seen.ContainsKey($key)) { return }
     $Seen[$key] = $true
     $sev = 'CRITICAL'; if ($kind -eq 'AFFECTED_ROOT') { $sev = 'WARNING' }
@@ -217,17 +441,23 @@ function Add-Finding($c, [string]$location, [string]$source, [string]$container,
     [void]$Findings.Add([ordered]@{
             severity = $sev; kind = $kind; indicator = $e.name; source = $source; location = $location; container = $container
             found_as = $how; store = $store; advice = $advice; running_processes = @(); signature_status = $null
-            certificate = [ordered]@{ subject_cn = (Get-CN $c.Subject); issuer_cn = (Get-CN $c.Issuer); serial = $c.SerialNumber.ToLowerInvariant()
-                not_before = $c.NotBefore.ToUniversalTime().ToString('s') + 'Z'; not_after = $c.NotAfter.ToUniversalTime().ToString('s') + 'Z'; sha256 = $sha }
+            certificate = (Get-CertSummary $c $sha)
         })
 }
 
 function Test-Bytes([byte[]]$bytes, [string]$location, [string]$source, [string]$container, [string]$store) {
-    foreach ($x in (Find-Certs $bytes)) { Add-Finding $x.Cert $location $source $container $x.How $store }
+    foreach ($x in (Find-Certs $bytes 0 (-not $CollectAll))) { Add-Finding $x.Cert $location $source $container $x.How $store }
+}
+
+function Test-OleStreams([byte[]]$bytes, [string]$location, [string]$source, [string]$prefix) {
+    foreach ($st in (Get-CfbSignatureStreams $bytes)) {
+        $Stats.ole_signature_streams++
+        Test-Bytes $st.Bytes $location $source ($prefix + $OlePrefix + $st.Name) $null
+    }
 }
 
 # ---- files -----------------------------------------------------------------------------------------
-$SignedExts = '.exe .dll .sys .ocx .cpl .scr .efi .mui .drv .com .msi .msp .msm .cab .cat .ps1 .psm1 .psd1 .ps1xml .psc1 .vbs .wsf .appx .msix .appxbundle .msixbundle .jar .war .ear .apk .aab .xpi .vsix .nupkg .so .dylib .node .bundle .pkg .winmd .xll .sst .stl .p7x .asar'.Split(' ')
+$SignedExts = '.exe .dll .sys .ocx .cpl .scr .efi .mui .drv .com .msi .msp .msm .cab .cat .ps1 .psm1 .psd1 .ps1xml .psc1 .cdxml .mof .vbs .vbe .wsf .appx .msix .appxbundle .msixbundle .jar .war .ear .apk .aab .xpi .vsix .nupkg .so .dylib .node .bundle .pkg .winmd .xll .sst .stl .p7x .asar'.Split(' ')
 $CertExts = '.pem .crt .cer .der .cert .p7b .p7c .p7s .spc .pfx .p12 .jks .keystore .truststore .bks .ks .ca-bundle .chain'.Split(' ')
 $TextExts = '.conf .cfg .cnf .config .yaml .yml .json .xml .properties .toml .ini .env'.Split(' ')
 $ZipExts = '.jar .war .ear .apk .aab .xpi .vsix .nupkg .appx .msix .appxbundle .msixbundle .zip .whl .ipa'.Split(' ')
@@ -275,7 +505,10 @@ function Test-Zip([object]$zipSource, [string]$location, [string]$source, [int]$
             $ms = New-Object System.IO.MemoryStream
             $st = $en.Open(); $st.CopyTo($ms); $st.Close()
             $data = $ms.ToArray()
-            if ($interesting) { Test-Bytes $data $location $source ($prefix + $en.FullName) $null }
+            if ($interesting) {
+                Test-OleStreams $data $location $source ($prefix + $en.FullName + '!/')
+                Test-Bytes $data $location $source ($prefix + $en.FullName) $null
+            }
             if ($nested -and $data.Length -gt 4 -and $data[0] -eq 0x50 -and $data[1] -eq 0x4b) {
                 Test-Zip (New-Object System.IO.MemoryStream (, $data)) $location $source ($depth + 1) ($prefix + $en.FullName + '!/')
             }
@@ -292,6 +525,7 @@ function Test-File([string]$p, [string]$source, [bool]$force) {
     if (-not (Test-Wanted $fi $force)) { return }
     $Visited[$full] = $true
     try { $bytes = [System.IO.File]::ReadAllBytes($full) } catch { $Stats.files_unreadable++; return }
+    Test-OleStreams $bytes $full $source ''
     Test-Bytes $bytes $full $source $null $null
     if ($bytes.Length -gt 4 -and $bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4b -and ($ZipExts -contains $fi.Extension.ToLowerInvariant())) {
         Test-Zip $full $full $source 0 ''
@@ -312,7 +546,12 @@ function Invoke-Walk([string[]]$roots, [string]$source) {
         while ($stack.Count -gt 0) {
             $d = $stack.Pop()
             try { $files = [System.IO.Directory]::GetFiles($d) } catch { $files = @() }
-            foreach ($f in $files) { Test-File $f $source $false }
+            foreach ($f in $files) {
+                if ($TimeLimitSec -gt 0 -and ([DateTime]::UtcNow - $script:WalkStart).TotalSeconds -gt $TimeLimitSec) {
+                    $Stats.time_limited = $true; return
+                }
+                Test-File $f $source $false
+            }
             try { $dirs = [System.IO.Directory]::GetDirectories($d) } catch { $dirs = @() }
             foreach ($sub in $dirs) {
                 $leaf = [System.IO.Path]::GetFileName($sub)
@@ -394,7 +633,31 @@ if ($SelfTest) {
 }
 
 try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop } catch { }
+# Resolve -Path against PowerShell's current location (Set-Location does not change the process working directory
+# that .NET file APIs use). A path that does not exist is an error, so that a typo cannot look like a clean result.
+if ($Path) {
+    $resolved = New-Object System.Collections.ArrayList
+    $missing = New-Object System.Collections.ArrayList
+    foreach ($p in $Path) {
+        $abs = $null           # (not $full: PowerShell variable names ignore case, and -Full is a parameter)
+        if ($p) { try { $abs = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($p) } catch { } }
+        if ($abs -and (Test-Path -LiteralPath $abs)) { [void]$resolved.Add($abs) } else { [void]$missing.Add($p) }
+    }
+    if ($missing.Count -gt 0) { [Console]::Error.WriteLine('error: path not found: ' + ($missing -join ', ')); exit 3 }
+    $Path = [string[]]$resolved.ToArray()
+}
 $t0 = [DateTime]::UtcNow
+$script:WalkStart = $t0      # -TimeLimitSec counts from the start of the scan, like --time-limit
+if ($ListCerts) {
+    if (-not $Path) { [Console]::Error.WriteLine('-ListCerts needs -Path'); exit 3 }
+    $IncludeSelf = [switch]$true
+    $TimeLimitSec = 0        # list mode always lists everything, like --list-certs
+    foreach ($p in $Path) {
+        if (Test-Path -LiteralPath $p -PathType Container) { Invoke-Walk @($p) 'file' } else { Test-File $p 'file' $true }
+    }
+    ConvertTo-Json -InputObject @($AllCerts) -Depth 5
+    exit 0
+}
 if (-not $NoTrustStores) {
     if (-not $Quiet) { [Console]::Error.WriteLine('Scanning trust stores and certificate bundles...') }
     Invoke-TrustStores
@@ -432,6 +695,7 @@ Write-Output ("eMudhra compromised-CA scanner {0} (PowerShell)  (Mozilla Bug 208
 Write-Output ("Host: {0}   PowerShell {1}   Mode: {2}" -f $hostDesc, $PSVersionTable.PSVersion, $mode)
 Write-Output ("Scanned {0} trust-store sources and {1} files ({2:N1} MB) in {3} s; {4} certificates parsed." -f $Stats.trust_store_sources, $Stats.files_scanned, ($Stats.bytes_scanned / 1e6), $seconds, $Stats.certificates_parsed)
 if ($Stats.files_skipped_size -or $Stats.files_unreadable) { Write-Output ("Skipped {0} files over the size limit and {1} unreadable files." -f $Stats.files_skipped_size, $Stats.files_unreadable) }
+if ($Stats.time_limited) { Write-Output 'Stopped scanning files early because of -TimeLimitSec; the file scan is incomplete.' }
 foreach ($sev in @('CRITICAL', 'WARNING', 'INFO')) {
     $g = @($sorted | Where-Object { $_.severity -eq $sev })
     if ($g.Count -eq 0) { continue }
