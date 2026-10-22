@@ -76,7 +76,8 @@ $Latin1 = [System.Text.Encoding]::GetEncoding(28591)
 # .ps1xml/.cdxml, "/* */" in .mof; Windows Script Host "'' SIG ''" (VBScript), "// SIG //" (JScript), <signature> (.wsf).
 $SigMarks = @('Begin signature block', '<signature>')
 $SigMarksU16 = @($SigMarks | ForEach-Object { $Latin1.GetString([System.Text.Encoding]::Unicode.GetBytes($_)) })   # UTF-16LE, seen through Latin-1
-$SigBlocks = @(@("SIG (?:#|''|//) Begin signature block", "SIG (?:#|''|//) End signature block"), @('<signature>', '</signature>'))
+# The end marker takes its line's "// " or "'' " with it: "/" is a base64 character (see emudhra_scan.py).
+$SigBlocks = @(@("SIG (?:#|''|//) Begin signature block", "(?:// |'' )?SIG (?:#|''|//) End signature block"), @('<signature>', '</signature>'))
 $PemBeginPattern = '-----BEGIN (X509 CERTIFICATE|TRUSTED CERTIFICATE|CERTIFICATE|PKCS7|CMS)-----'
 $SigDecorationPattern = "'' SIG ''|// SIG //|\*\* SIG \*\*|/\*|\*/"   # decorations made of base64 characters ("SIG", "/")
 $Sha256 = [System.Security.Cryptography.SHA256]::Create()

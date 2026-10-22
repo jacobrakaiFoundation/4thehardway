@@ -233,9 +233,9 @@ def main():
                 if k not in kinds:
                     print("  note: no embedded-signed %s file on this runner, so none was tested" % k)
             if os.environ.get("E2E_ALLOW_STORE_CHANGES") == "1":
-                for k in ("self-ps1", "self-vbs"):     # Windows can always sign these two; the others are best effort
+                for k in ("self-ps1", "self-vbs", "self-vbe", "self-js", "self-wsf", "self-cdxml", "self-mof"):
                     if k not in kinds:
-                        failures.append("Windows did not sign the %s test file" % k[5:])
+                        failures.append("Windows did not sign the .%s test file" % k[5:])
         before = dict((i["path"], file_sha256(i["path"])) for i in items)
         certs = list_certs(a.scanner, [i["path"] for i in items]) if items else []
         norm = lambda p: os.path.normcase(os.path.realpath(p))

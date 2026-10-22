@@ -265,7 +265,10 @@ PEM_END_RE = re.compile(b"-----END ")
 #               "/* SIG # ... */" in DSC .mof files.
 #   Windows Script Host: "'' SIG '' Begin signature block" in VBScript, "// SIG // Begin signature block" in JScript,
 #               and a <signature> element of "** SIG **" lines in .wsf files.
-SCRIPT_SIG_BLOCKS = ((re.compile(b"SIG (?:#|''|//) Begin signature block"), re.compile(b"SIG (?:#|''|//) End signature block")),
+# The end marker takes its line's "// " or "'' " with it: "/" is a base64 character, and a stray "//" after the data
+# corrupts the decoding whenever the base64 ends in padding.
+SCRIPT_SIG_BLOCKS = ((re.compile(b"SIG (?:#|''|//) Begin signature block"),
+                      re.compile(b"(?:// |'' )?SIG (?:#|''|//) End signature block")),
                      (re.compile(b"<signature>"), re.compile(b"</signature>")))
 SCRIPT_SIG_MARKS = (b"Begin signature block", b"<signature>")
 SCRIPT_SIG_MARKS_U16 = tuple(m.decode().encode("utf-16-le") for m in SCRIPT_SIG_MARKS)   # scripts saved as UTF-16

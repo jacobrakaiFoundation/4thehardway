@@ -139,7 +139,7 @@ CI runs on Linux, macOS and Windows, with Python 3.9 to 3.13, Windows PowerShell
   - macOS: a keychain added to the search list.
   - Linux: an NSS database made with `certutil` and a Java keystore made with `keytool`.
 - **Real signed files.** The scanner must extract the same signer certificate that the operating system's own tools report:
-  - Windows: `Get-AuthenticodeSignature` on real MSI, EXE, DLL and PowerShell files, and on `.cdxml`, `.mof` and VBScript files when the runner has embedded-signed ones. Each file is copied first, so an update that replaces it during the test can't cause a false failure. Windows also signs `.ps1`, `.vbs`, `.js`, `.wsf`, `.cdxml` and `.mof` test files with a throwaway certificate, so the scanner is checked against the formats Windows itself writes.
+  - Windows: `Get-AuthenticodeSignature` on real MSI, EXE, DLL and PowerShell files, and on `.cdxml`, `.mof` and VBScript files when the runner has embedded-signed ones. Each file is copied first, so an update that replaces it during the test can't cause a false failure. Windows also signs `.ps1`, `.cdxml`, `.mof`, `.vbs`, `.vbe`, `.js` and `.wsf` test files with a throwaway certificate, so the scanner is checked against the formats Windows itself writes.
   - macOS: `codesign` on Apple system binaries.
   - Linux: a JAR signed with `jarsigner` during the test.
 - **Command-line paths.** A path that doesn't exist must be an error, and a relative path must be read from the current directory, including PowerShell's current location.

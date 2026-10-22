@@ -229,6 +229,17 @@ class TestContainers(ScanBase):
             f = self.scan_blob(data, name)
             self.assertEqual([(x["kind"], x["found_as"]) for x in f], [("COMPROMISED_CA_CERT", "script-signature")], name)
 
+    def test_script_signature_formats_at_every_padding(self):
+        # Base64 ends in "", "=" or "==" depending on the length: a stray decoration character next to the padding
+        # broke JScript blocks for some lengths only (found by signing real files on Windows).
+        builders = (("a.ps1", ps1_signed), ("a.ps1xml", ps1xml_signed), ("a.mof", mof_signed), ("a.wsf", wsf_signed),
+                    ("a.vbs", lambda b: wsh_signed(b, "vbs")), ("a.js", lambda b: wsh_signed(b, "js")),
+                    ("u.vbs", lambda b: wsh_signed(b, "vbs", utf16=True)), ("u.psd1", lambda b: ps1_signed(b, utf16=True)))
+        for name, build in builders:
+            for pad in range(6):
+                f = self.scan_blob(build(pkcs7([CA_DER]) + bytes(range(pad))), name)
+                self.assertEqual(kinds(f), [("COMPROMISED_CA_CERT", "EM OV CS CA - G3C")], (name, pad))
+
     def test_signature_like_text_without_a_certificate_is_harmless(self):
         junk = b"<signature>** SIG ** not base64 at all ~~~~~~~~~~~~~~~~~~~~~~~~</signature>\r\n" \
                b"# SIG # Begin signature block\r\n# @@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n# SIG # End signature block\r\n"
