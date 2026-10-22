@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+/samples/
+/py-samples.json
+/ps-samples.json
+/quick-*.json
+/default-*.json
+/report*.json

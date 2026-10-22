@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"   # weekly: catch runner image and trust store changes
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python ${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Indicators are embedded in both scanners
+        run: python tools/embed_indicators.py --check
+      - name: Self-test
+        run: python emudhra_scan.py --self-test
+      - name: Sample files are flagged exactly as expected
+        shell: bash
+        run: |
+          python tests/make_samples.py samples
+          set +e
+          python emudhra_scan.py --no-trust-stores --no-processes --quiet --path samples --json py-samples.json
+          rc=$?
+          set -e
+          test "$rc" -eq 2
+          python tests/compare_reports.py samples/expected.json py-samples.json
+      - name: Scan this runner's trust stores (report only)
+        shell: bash
+        run: |
+          set +e
+          python emudhra_scan.py --quick --json "quick-${{ runner.os }}-py${{ matrix.python }}.json"
+          rc=$?
+          set -e
+          echo "exit code $rc"
+          test "$rc" -le 2
+      - name: Default scan of this runner (report only)
+        if: matrix.python == '3.13'
+        continue-on-error: true
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set +e
+          python emudhra_scan.py --json "default-${{ runner.os }}.json"
+          echo "exit code $?"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports-${{ runner.os }}-py${{ matrix.python }}
+          path: "*.json"
+          if-no-files-found: ignore
+
+  powershell:
+    name: ${{ matrix.shell }} on Windows
+    runs-on: windows-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]   # Windows PowerShell 5.1 and PowerShell 7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5   # only used to generate the sample files
+        with:
+          python-version: "3.13"
+      - name: Self-test
+        shell: bash
+        run: ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File ./Scan-EmudhraRevoked.ps1 -SelfTest
+      - name: Sample files are flagged exactly as expected
+        shell: bash
+        run: |
+          python tests/make_samples.py samples
+          set +e
+          ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File ./Scan-EmudhraRevoked.ps1 -NoTrustStores -NoProcesses -Quiet -Path samples -JsonOut ps-samples.json
+          rc=$?
+          set -e
+          test "$rc" -eq 2
+          python tests/compare_reports.py samples/expected.json ps-samples.json
+      - name: Scan this runner's certificate stores (report only)
+        shell: bash
+        run: |
+          set +e
+          ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File ./Scan-EmudhraRevoked.ps1 -Quick -JsonOut "quick-${{ matrix.shell }}.json"
+          rc=$?
+          set -e
+          echo "exit code $rc"
+          test "$rc" -le 2
+      - name: Default scan of this runner (report only)
+        continue-on-error: true
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set +e
+          ${{ matrix.shell }} -NoProfile -ExecutionPolicy Bypass -File ./Scan-EmudhraRevoked.ps1 -JsonOut "default-${{ matrix.shell }}.json"
+          echo "exit code $?"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports-windows-${{ matrix.shell }}
+          path: "*.json"
+          if-no-files-found: ignore
