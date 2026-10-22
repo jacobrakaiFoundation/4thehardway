@@ -9,7 +9,7 @@ On 17 October 2026 a researcher reported that the private keys of 8 eMudhra inte
 This tool tells you where those keys still show up on a machine.
 
 - It runs locally, only reads files, and makes **no network connections**.
-- `emudhra_scan.py` is one file that needs only Python 3.8 or newer, with nothing to install.
+- `emudhra_scan.py` is one file that needs only Python 3.9 or newer, with nothing to install.
 - `Scan-EmudhraRevoked.ps1` is a native PowerShell version for Windows machines without Python. It runs in Windows PowerShell 5.1 and PowerShell 7.
 
 ## Quick start
@@ -124,6 +124,10 @@ python -m unittest discover -s tests -v   # unit tests (standard library only)
 python tools/embed_indicators.py          # after editing indicators/indicators.json
 ```
 
-CI runs the tests and real scans on Linux, macOS and Windows, using Python 3.9 and 3.13, Windows PowerShell 5.1 and PowerShell 7. Both scanners are checked against the same set of sample files.
+CI runs the tests and real scans on Linux, macOS and Windows, using Python 3.9 to 3.13, Windows PowerShell 5.1 and PowerShell 7. Both scanners are checked against the same set of sample files.
+
+## Credits
+
+Built by [@jacobyoby](https://github.com/jacobyoby) with Claude, Anthropic's AI model.
 
 This project is not affiliated with eMudhra, Mozilla, Google or Sectigo. It is released under the MIT License.

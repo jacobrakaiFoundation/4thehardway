@@ -4,7 +4,7 @@
 emudhra_scan.py - find trust stores, signed programs and certificate files that still
 carry or chain to the eMudhra CA keys compromised in October 2026 (Mozilla Bug 2083449).
 
-* Standard library only. Python 3.8 or newer on Linux, macOS and Windows.
+* Standard library only. Python 3.9 or newer on Linux, macOS and Windows.
 * Read-only. It opens files and OS certificate stores and makes no network connections.
 
 What it reports:

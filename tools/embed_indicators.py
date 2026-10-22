@@ -36,7 +36,7 @@ for name, subs in targets.items():
         new, n = re.subn(pat, lambda m: rep, new, count=1, flags=re.S)
         if n != 1:
             sys.exit("%s: marker not found: %s" % (name, pat))
-    if new != src:
+    if new.replace("\r\n", "\n") != src.replace("\r\n", "\n"):   # ignore CRLF checkouts
         stale.append(name)
         if "--check" not in sys.argv:
             with open(path, "w", encoding="utf-8", newline="") as fh:

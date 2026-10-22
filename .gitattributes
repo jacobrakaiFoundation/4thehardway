@@ -1,0 +1,4 @@
+# Keep LF everywhere so the embedded-indicator check and PEM fixtures match on Windows checkouts.
+* text=auto eol=lf
+*.pem text eol=lf
+*.zip binary
