@@ -149,6 +149,8 @@ The end-to-end store test and the Windows signing test change OS certificate sto
 
 ## Credits
 
+Published by the [Jacobrakai Foundation](https://jacobrakai.org/). The Foundation's other security research, each piece with its method and limits stated, is at [jacobrakai.org/research](https://jacobrakai.org/research/).
+
 Built by [@jacobyoby](https://github.com/jacobyoby) with Claude, Anthropic's AI model.
 
 This project is not affiliated with eMudhra, Mozilla, Google or Sectigo. It is released under the MIT License.
