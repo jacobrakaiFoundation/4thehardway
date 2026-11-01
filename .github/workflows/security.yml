@@ -1,0 +1,25 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    - cron: "17 6 * * 1"
+
+concurrency:
+  group: security-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  security-events: write
+  pull-requests: write
+
+jobs:
+  scan:
+    if: github.event.pull_request.draft != true
+    uses: jacobrakaiFoundation/.github/.github/workflows/security-scan.yml@main
+    with:
+      codeql-languages: '["python"]'
