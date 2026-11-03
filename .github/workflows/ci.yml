@@ -99,7 +99,7 @@ jobs:
           test "$rc" -le 2
           python tests/check_report.py "default-${{ runner.os }}.json" --min-certs 50 --min-sources 1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: reports-${{ runner.os }}-py${{ matrix.python }}
@@ -172,7 +172,7 @@ jobs:
           test "$rc" -le 2
           python tests/check_report.py "default-${{ matrix.shell }}.json" --min-certs 50 --min-sources 1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: reports-windows-${{ matrix.shell }}
